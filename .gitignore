@@ -1,4 +1,5 @@
 .vs
+.vscode
 build
 out
 SDL3-3.4.8
