@@ -3,3 +3,4 @@ build
 out
 SDL3-3.4.8
 setup_cuda118_env.bat
+CMakeLists.txt
