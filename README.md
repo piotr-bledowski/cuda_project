@@ -47,7 +47,8 @@ set(CMAKE_CUDA_ARCHITECTURES "native")
 
 find_package(SDL3 REQUIRED)
 
-add_executable(main main.cu)
+# kernels.cu — CUDA kernels; ui.cpp — SDL rendering (compiled as C++)
+add_executable(main main.cu kernels.cu ui.cpp)
 
 set_target_properties(main PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
