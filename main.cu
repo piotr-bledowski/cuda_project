@@ -20,6 +20,39 @@
 #include "kernels.cuh"
 #include "ui.h"
 
+
+void update_central_wall(bool* h_wall, bool* d_wall, int num_holes, bool is_open, bool wipe_board) {
+    
+    if (wipe_board) {
+        std::fill(h_wall, h_wall + (HEIGHT * WIDTH), false);
+    }
+
+    for (int y = 0; y < HEIGHT; ++y) {
+        h_wall[S_IDX(y, WALL_X)] = true;
+    }
+
+    if (is_open) {
+        // Scale: 1 = 30px, 2 = 15px, 3 = 10px, 4 = 7px
+        int hole_size = 30 / num_holes;
+        int total_hole_space = num_holes * hole_size;
+        int remaining_wall = HEIGHT - total_hole_space;
+        int spacing = remaining_wall / (num_holes + 1); 
+
+        int current_y = spacing;
+        for (int i = 0; i < num_holes; ++i) {
+            
+            for (int j = 0; j < hole_size && current_y < HEIGHT; ++j) {
+                h_wall[S_IDX(current_y, WALL_X)] = false;
+                current_y++;
+            }
+            current_y += spacing;
+        }
+    }
+
+    size_t msk_sz = (size_t)HEIGHT * WIDTH * sizeof(bool);
+    cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 int main(int /*argc*/, char * /*argv*/[])
@@ -79,7 +112,10 @@ int main(int /*argc*/, char * /*argv*/[])
     cudaMemset(d_uy, 0, sc_sz);
 
     bool hole_open = true;
-    rebuild_wall(h_wall, d_wall, hole_open);
+
+    int current_holes = 1;
+    int current_hole_size = 10;
+    update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
 
     // ── Kernel launch config ──────────────────────────────────────────────────
     const dim3 block2d(16, 16);
@@ -87,8 +123,7 @@ int main(int /*argc*/, char * /*argv*/[])
 
     // Theoretical occupancy for the most compute-heavy kernel
     int maxActiveBlocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &maxActiveBlocks, k_macroscopic, block2d.x * block2d.y, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, k_macroscopic, block2d.x * block2d.y, 0);
     float occupancy = 100.f * (maxActiveBlocks * block2d.x * block2d.y) / (float)devProp.maxThreadsPerMultiProcessor;
 
     // ── Stats struct ──────────────────────────────────────────────────────────
@@ -108,19 +143,102 @@ int main(int /*argc*/, char * /*argv*/[])
     Uint64 prev_ticks = SDL_GetTicks();
     bool running = true;
 
+    bool is_drawing = false;
+    bool is_erasing = false;
+
     while (running)
     {
+        bool wall_updated = false;
+
         // Events
         SDL_Event ev;
         while (SDL_PollEvent(&ev))
         {
             if (ev.type == SDL_EVENT_QUIT)
                 running = false;
-            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_SPACE)
+
+
+            // R - Reset 
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_R)
             {
-                hole_open = !hole_open;
-                rebuild_wall(h_wall, d_wall, hole_open);
+                std::vector<float> h_f_reset(HEIGHT * WIDTH * Q);
+                for (int y = 0; y < HEIGHT; ++y) {
+                    for (int x = 0; x < WIDTH; ++x) {
+                        float r = (x < WALL_X) ? RHO_LEFT : RHO_RIGHT;
+                        h_rho[S_IDX(y, x)] = r;
+                        for (int i = 0; i < Q; ++i) {
+                            h_f_reset[F_IDX(y, x, i)] = w0[i] * r;
+                        }
+                    }
+                }
+                cudaMemcpy(d_f_in, h_f_reset.data(), f_sz, cudaMemcpyHostToDevice);
+                cudaMemcpy(d_rho, h_rho.data(), sc_sz, cudaMemcpyHostToDevice);
+                cudaMemset(d_ux, 0, sc_sz); 
+                cudaMemset(d_uy, 0, sc_sz);
             }
+
+            // SPACE - open/close holes
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_SPACE) {
+                hole_open = !hole_open;
+                update_central_wall(h_wall, d_wall, current_holes, hole_open, false);
+            }
+
+            // C - clear custom walls
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_C) {
+                update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
+            }
+
+            // 1-4 number of holes
+            if (ev.type == SDL_EVENT_KEY_DOWN) {
+                int new_holes = -1;
+                if (ev.key.key == SDLK_1) new_holes = 1;
+                if (ev.key.key == SDLK_2) new_holes = 2;
+                if (ev.key.key == SDLK_3) new_holes = 3;
+                if (ev.key.key == SDLK_4) new_holes = 4;
+
+                if (new_holes != -1 && new_holes != current_holes) {
+                    current_holes = new_holes;
+                    update_central_wall(h_wall, d_wall, current_holes, hole_open, false);
+                }
+            }
+
+            // Draw/erase
+            if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                if (ev.button.button == SDL_BUTTON_LEFT) is_drawing = true;
+                if (ev.button.button == SDL_BUTTON_RIGHT) is_erasing = true;
+            }
+            else if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                if (ev.button.button == SDL_BUTTON_LEFT) is_drawing = false;
+                if (ev.button.button == SDL_BUTTON_RIGHT) is_erasing = false;
+            }
+        }
+
+        if (is_drawing || is_erasing) {
+            float mouse_x, mouse_y;
+            SDL_GetMouseState(&mouse_x, &mouse_y);
+
+            // Przeliczenie pikseli na indeks siatki LBM
+            int grid_x = (int)mouse_x / CELL_SIZE;
+            int grid_y = (int)mouse_y / CELL_SIZE;
+
+            // Zabezpieczenie przed wyjściem myszką poza ekran
+            if (grid_x >= 0 && grid_x < WIDTH && grid_y >= 0 && grid_y < HEIGHT) {
+                int idx = S_IDX(grid_y, grid_x);
+
+                if (is_drawing && !h_wall[idx]) {
+                    h_wall[idx] = true;
+                    wall_updated = true;
+                }
+                else if (is_erasing && h_wall[idx]) {
+                    h_wall[idx] = false;
+                    wall_updated = true;
+                }
+            }
+        }
+
+        // Jeśli tablica ścian na procesorze się zmieniła, synchronizujemy ją z kartą graficzną
+        if (wall_updated) {
+            cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
         }
 
         // Simulation step
