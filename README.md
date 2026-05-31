@@ -1,8 +1,85 @@
 # cuda_project
 
-GPU-accelerated **2D lattice Boltzmann (D2Q9)** fluid simulation. Two chambers with different density are separated by a wall with a central hole; flow develops from the pressure/density gradient. The physics run in **CUDA**; **SDL3** handles the window, keyboard input, and drawing density and velocity fields.
+GPU-accelerated **2D lattice Boltzmann (D2Q9)** fluid simulation. Two chambers with different density are separated by a wall with holes; flow develops from the pressure/density gradient. Physics run in **CUDA**; **SDL3** handles the window, input, and rendering of density and velocity fields.
 
-**Controls:** Space — open/close the hole · Close window — quit
+Each rendered frame runs **N** LBM substeps on the GPU (configurable via CLI, default 16). The stats bar reports **FPS** (frames per second) and **SPS** (simulation steps per second = N × FPS) so you can see when the GPU becomes the bottleneck.
+
+---
+
+## Source layout
+
+| File | Role |
+|------|------|
+| `main.cu` | Entry point, simulation loop, CLI parsing, wall updates |
+| `kernels.cu` / `kernels.cuh` | CUDA kernels (fused collide, shared-memory streaming, BC) |
+| `sim_params.h` | Grid size, physics constants, indexing macros |
+| `ui.cpp` / `ui.h` | SDL window, three-panel rendering, stats overlay |
+
+`CMakeLists.txt`, `build/`, `SDL3-*`, and local helper scripts are not tracked in git — you create/configure those locally (see [Setup](#setup)).
+
+---
+
+## Run
+
+After building (see below), from the `build\` directory:
+
+```bat
+main.exe              rem default: 16 LBM steps per frame
+main.exe 32           rem 32 steps per frame
+main.exe -n 64        rem same as above
+main.exe --help       rem show CLI options
+```
+
+On startup the program prints the chosen step count to stderr, e.g. `LBM: 16 step(s) per frame`.
+
+Keep `SDL3.dll` next to `main.exe` (the CMake post-build step copies it).
+
+### CLI: steps per frame
+
+| Option | Description |
+|--------|-------------|
+| `-n N`, `--steps N` | Run **N** full LBM cycles (collide → stream → walls → BC) before each render. Default: **16**. Must be ≥ 1. |
+| positional `N` | Same as `-n N` (e.g. `main.exe 32`). |
+| `-h`, `--help` | Print usage and exit. |
+
+**Benchmarking GPU throughput:** increase N until FPS drops below the 60 Hz cap or SPS stops scaling — that is roughly your simulation ceiling on the current grid and kernels.
+
+### Performance stats (on-screen)
+
+| Metric | Meaning |
+|--------|---------|
+| **FPS** | Rendered frames per second (VSync-capped at 60 when the GPU keeps up). |
+| **SPS** | Lattice updates per second (`steps_per_frame × FPS`). |
+| **Step** | Total LBM steps since start. |
+| **(N st/fr)** | Current `steps_per_frame` from CLI. |
+
+---
+
+## Controls
+
+| Input | Action |
+|-------|--------|
+| **Space** | Open / close holes in the central wall |
+| **1–4** | Number of holes (1 = one large hole, 4 = four smaller holes) |
+| **B** | Toggle boundary mode: **closed** (bounce-back on all outer walls) ↔ **open** (Zou–He fixed-density reservoirs on west/east) |
+| **R** | Reset simulation to initial left/right density split |
+| **C** | Clear user-drawn walls (keeps central wall + hole state) |
+| **LMB drag** | Draw solid walls |
+| **RMB drag** | Erase walls |
+| Close window | Quit |
+
+---
+
+## CUDA implementation notes
+
+The inner loop uses optimised kernels (see `kernels.cu`):
+
+- **`k_collide`** — fuses macroscopic moment extraction and BGK collision in one pass; ρ and **u** stay in registers during substeps (no per-step global writes to scalar fields).
+- **`k_streaming_shmem`** — pull streaming with an 18×18 shared-memory tile (16×16 block + 1-cell halo); neighbour reads come from shared memory instead of repeated global loads.
+- **`k_wall_bounce_back`**, **`k_outer_boundary`** — interior walls and domain edges (closed container or open reservoirs).
+- **`k_macroscopic`** — runs once per frame after all substeps to fill ρ, ux, uy for display.
+
+Substeps are queued back-to-back without `cudaDeviceSynchronize` between them; one sync and one device→host copy of scalar fields happen per rendered frame.
 
 ---
 
@@ -17,8 +94,6 @@ GPU-accelerated **2D lattice Boltzmann (D2Q9)** fluid simulation. Two chambers w
 | [SDL3](https://github.com/libsdl-org/SDL/releases) | Developer package (see below) |
 
 Optional but recommended: **Ninja** (bundled with VS under `Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja`, or via CMake).
-
-The repository ships **`main.cu`** only. You must add `CMakeLists.txt`, download SDL3, and configure paths yourself (`build/`, `SDL3-*`, and local helper scripts are gitignored).
 
 ---
 
@@ -47,7 +122,6 @@ set(CMAKE_CUDA_ARCHITECTURES "native")
 
 find_package(SDL3 REQUIRED)
 
-# kernels.cu — CUDA kernels; ui.cpp — SDL rendering (compiled as C++)
 add_executable(main main.cu kernels.cu ui.cpp)
 
 set_target_properties(main PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -102,13 +176,7 @@ cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 cmake --build .
 ```
 
-**Run** (Ninja puts the exe in `build\`, not `build\Release\`):
-
-```bat
-main.exe
-```
-
-Keep `SDL3.dll` next to `main.exe` (the post-build step above copies it).
+Ninja puts the executable in `build\main.exe`, not `build\Release\`.
 
 ---
 
