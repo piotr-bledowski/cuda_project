@@ -26,7 +26,11 @@ struct FrameStats {
     float occupancy_pct;
     char  gpu_name[256];
     bool  hole_open;
-    bool  bc_closed;           // true = closed mixing box, false = open reservoirs
+    bool  bc_closed;
+    char  scenario_name[32];
+    float rho_ref_high;
+    float rho_ref_low;
+    bool  scenario_has_partition; // Chambers: show hole controls
     int   step;
     float nu;                  // kinematic viscosity = (TAU-0.5)/3
 };

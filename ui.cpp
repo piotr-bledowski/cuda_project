@@ -100,7 +100,7 @@ static void fill_sim_texture(SDL_Texture* tex,
 SDL_Window* ui_create_window()
 {
     return SDL_CreateWindow(
-        "LBM CUDA  |  D2Q9 Fluid Simulation  |  [SPACE] hole  [B] BC  [R] reset",
+        "LBM CUDA  |  [TAB] scenario  [R] reset  [SPACE] action",
         WIN_W, WIN_H, 0);
 }
 
@@ -176,14 +176,24 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
     txt(ren, 8.f, sy, buf);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f   Hole: %s   BC: %s",
-             (double)RHO_LEFT, (double)RHO_RIGHT,
-             stats.hole_open ? "OPEN  " : "CLOSED",
-             stats.bc_closed ? "CLOSED" : "OPEN  ");
-    if (stats.hole_open)
+    snprintf(buf, sizeof(buf), "Scenario: %s   rho_hi: %.3f   rho_lo: %.3f",
+             stats.scenario_name,
+             (double)stats.rho_ref_high, (double)stats.rho_ref_low);
+    txt(ren, 8.f, sy, buf, 200, 220, 255);
+    sy += LINE_H;
+
+    if (stats.scenario_has_partition) {
+        snprintf(buf, sizeof(buf), "Hole: %s   BC: %s",
+                 stats.hole_open ? "OPEN  " : "CLOSED",
+                 stats.bc_closed ? "CLOSED" : "OPEN  ");
+        if (stats.hole_open)
+            txt(ren, 8.f, sy, buf, 255, 205, 80);
+        else
+            txt(ren, 8.f, sy, buf, 160, 160, 160);
+    } else {
+        snprintf(buf, sizeof(buf), "BC: CLOSED   [SPACE] burst bubble");
         txt(ren, 8.f, sy, buf, 255, 205, 80);
-    else
-        txt(ren, 8.f, sy, buf, 160, 160, 160);
+    }
     sy += LINE_H;
 
     snprintf(buf, sizeof(buf), "GPU: %s   SMs: %d", stats.gpu_name, stats.sm_count);

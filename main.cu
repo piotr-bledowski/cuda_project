@@ -1,15 +1,8 @@
 /*
  * LBM D2Q9 CUDA Fluid Simulation
  *
- * Two chambers separated by a vertical wall with a central hole.
- * Left chamber starts denser (RHO_LEFT), right is lighter (RHO_RIGHT).
- * Press SPACE to open/close the hole.
- *
- * File layout:
- *   sim_params.h  — grid constants, index macros
- *   kernels.cuh/cu — CUDA kernels + rebuild_wall
- *   ui.h/cpp      — SDL window, rendering, stats overlay
- *   main.cu       — simulation loop (this file)
+ * Scenario-driven initial conditions, walls, and outer BC.
+ * Tab — cycle scenario | R — reset | SPACE — scenario action
  */
 
 #include <cuda_runtime.h>
@@ -18,7 +11,9 @@
 #include <vector>
 #include <algorithm>
 #include "sim_params.h"
+#include "sim_config.h"
 #include "kernels.cuh"
+#include "scenarios.h"
 #include "ui.h"
 
 
@@ -44,64 +39,55 @@ static void capture_viz_bounds(const float* h_rho,
     stats.viz_vel_scale = std::max(vel_max, U_MAX * 0.05f);
 }
 
+static void apply_scenario(SimScenario& scenario,
+                           float* h_rho, float* h_ux, float* h_uy, float* h_f,
+                           bool* h_wall,
+                           float* d_f_in, float* d_rho, float* d_ux, float* d_uy,
+                           bool* d_wall,
+                           size_t f_sz, size_t sc_sz, size_t msk_sz,
+                           FrameStats& stats)
+{
+    scenario.reset_walls(h_wall, true);
+    scenario.reset_fields(h_rho, h_ux, h_uy, h_f);
+    upload_outer_bc(scenario.outer_bc());
 
-void update_central_wall(bool* h_wall, bool* d_wall, int num_holes, bool is_open, bool wipe_board) {
-    
-    if (wipe_board) {
-        std::fill(h_wall, h_wall + (HEIGHT * WIDTH), false);
-    }
-
-    for (int y = 0; y < HEIGHT; ++y) {
-        h_wall[S_IDX(y, WALL_X)] = true;
-    }
-
-    if (is_open) {
-        // Scale: 1 = 30px, 2 = 15px, 3 = 10px, 4 = 7px
-        int hole_size = 30 / num_holes;
-        int total_hole_space = num_holes * hole_size;
-        int remaining_wall = HEIGHT - total_hole_space;
-        int spacing = remaining_wall / (num_holes + 1); 
-
-        int current_y = spacing;
-        for (int i = 0; i < num_holes; ++i) {
-            
-            for (int j = 0; j < hole_size && current_y < HEIGHT; ++j) {
-                h_wall[S_IDX(current_y, WALL_X)] = false;
-                current_y++;
-            }
-            current_y += spacing;
-        }
-    }
-
-    size_t msk_sz = (size_t)HEIGHT * WIDTH * sizeof(bool);
+    cudaMemcpy(d_f_in, h_f, f_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rho, h_rho, sc_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ux, h_ux, sc_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_uy, h_uy, sc_sz, cudaMemcpyHostToDevice);
     cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
+
+    snprintf(stats.scenario_name, sizeof(stats.scenario_name), "%s", scenario.name());
+    stats.rho_ref_high = scenario.display_rho_high();
+    stats.rho_ref_low  = scenario.display_rho_low();
+    stats.hole_open = scenario.supports_internal_wall() && scenario.chambers.hole_open;
+    stats.scenario_has_partition = scenario.supports_internal_wall();
+    stats.bc_closed = true;
+    capture_viz_bounds(h_rho, h_ux, h_uy, h_wall, stats);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-int main(int /*argc*/, char * /*argv*/[])
+int main(int /*argc*/, char* /*argv*/[])
 {
-    // ── SDL setup ─────────────────────────────────────────────────────────────
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window *window = ui_create_window();
-    SDL_Renderer *ren = ui_create_renderer(window);
-    SDL_Texture *tex = ui_create_sim_texture(ren);
+    SDL_Window* window = ui_create_window();
+    SDL_Renderer* ren = ui_create_renderer(window);
+    SDL_Texture* tex = ui_create_sim_texture(ren);
 
-    // ── GPU info ──────────────────────────────────────────────────────────────
     cudaDeviceProp devProp;
     cudaGetDeviceProperties(&devProp, 0);
 
-    // ── Device allocations ────────────────────────────────────────────────────
     const size_t f_sz = (size_t)HEIGHT * WIDTH * Q * sizeof(float);
     const size_t sc_sz = (size_t)HEIGHT * WIDTH * sizeof(float);
     const size_t msk_sz = (size_t)HEIGHT * WIDTH * sizeof(bool);
 
     float *d_f_in, *d_f_out, *d_rho, *d_ux, *d_uy;
-    bool *d_wall;
+    bool* d_wall;
     cudaMalloc(&d_f_in, f_sz);
     cudaMalloc(&d_f_out, f_sz);
     cudaMalloc(&d_rho, sc_sz);
@@ -109,183 +95,148 @@ int main(int /*argc*/, char * /*argv*/[])
     cudaMalloc(&d_uy, sc_sz);
     cudaMalloc(&d_wall, msk_sz);
 
-    // ── Host allocations ──────────────────────────────────────────────────────
     std::vector<float> h_rho(HEIGHT * WIDTH, 0.f);
     std::vector<float> h_ux(HEIGHT * WIDTH, 0.f);
     std::vector<float> h_uy(HEIGHT * WIDTH, 0.f);
-    bool *h_wall = new bool[HEIGHT * WIDTH]();
+    std::vector<float> h_f(HEIGHT * WIDTH * Q);
+    bool* h_wall = new bool[HEIGHT * WIDTH]();
 
-    // ── Initial conditions ────────────────────────────────────────────────────
-    const float w0[Q] = {4.f / 9.f,
-                         1.f / 9.f, 1.f / 9.f, 1.f / 9.f, 1.f / 9.f,
-                         1.f / 36.f, 1.f / 36.f, 1.f / 36.f, 1.f / 36.f};
-    {
-        std::vector<float> h_f(HEIGHT * WIDTH * Q);
-        for (int y = 0; y < HEIGHT; ++y)
-            for (int x = 0; x < WIDTH; ++x)
-            {
-                float r = (x < WALL_X) ? RHO_LEFT : RHO_RIGHT;
-                h_rho[S_IDX(y, x)] = r;
-                for (int i = 0; i < Q; ++i)
-                    h_f[F_IDX(y, x, i)] = w0[i] * r;
-            }
-        cudaMemcpy(d_f_in, h_f.data(), f_sz, cudaMemcpyHostToDevice);
-    }
-    cudaMemcpy(d_rho, h_rho.data(), sc_sz, cudaMemcpyHostToDevice);
-    cudaMemset(d_ux, 0, sc_sz);
-    cudaMemset(d_uy, 0, sc_sz);
+    SimScenario scenario;
+    scenario_set_id(scenario, ScenarioId::Chambers);
 
-    bool hole_open = true;
-    int  bc_mode = BC_CLOSED;
+    FrameStats stats = {};
+    stats.fps = (float)TARGET_FPS;
 
-    int current_holes = 1;
-    int current_hole_size = 10;
-    update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
+    apply_scenario(scenario, h_rho.data(), h_ux.data(), h_uy.data(), h_f.data(),
+                   h_wall, d_f_in, d_rho, d_ux, d_uy, d_wall,
+                   f_sz, sc_sz, msk_sz, stats);
 
-    // ── Kernel launch config ──────────────────────────────────────────────────
     const dim3 block2d(16, 16);
     const dim3 grid2d((WIDTH + 15) / 16, (HEIGHT + 15) / 16);
 
-    // Theoretical occupancy for the most compute-heavy kernel
     int maxActiveBlocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, k_macroscopic, block2d.x * block2d.y, 0);
-    float occupancy = 100.f * (maxActiveBlocks * block2d.x * block2d.y) / (float)devProp.maxThreadsPerMultiProcessor;
-
-    // ── Stats struct ──────────────────────────────────────────────────────────
-    FrameStats stats = {};
-    stats.fps = (float)TARGET_FPS;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &maxActiveBlocks, k_macroscopic, block2d.x * block2d.y, 0);
     stats.grid_x = (int)grid2d.x;
     stats.grid_y = (int)grid2d.y;
     stats.block_x = (int)block2d.x;
     stats.block_y = (int)block2d.y;
     stats.sm_count = devProp.multiProcessorCount;
-    stats.occupancy_pct = occupancy;
+    stats.occupancy_pct = 100.f * (maxActiveBlocks * block2d.x * block2d.y)
+        / (float)devProp.maxThreadsPerMultiProcessor;
     stats.nu = (TAU - 0.5f) / 3.f;
     snprintf(stats.gpu_name, sizeof(stats.gpu_name), "%s", devProp.name);
-    capture_viz_bounds(h_rho.data(), h_ux.data(), h_uy.data(), h_wall, stats);
 
-    // ── Main loop ─────────────────────────────────────────────────────────────
     const Uint64 ms_per_frame = 1000u / TARGET_FPS;
     Uint64 prev_ticks = SDL_GetTicks();
     bool running = true;
-
     bool is_drawing = false;
     bool is_erasing = false;
 
     while (running)
     {
         bool wall_updated = false;
+        bool fields_updated = false;
 
-        // Events
         SDL_Event ev;
         while (SDL_PollEvent(&ev))
         {
             if (ev.type == SDL_EVENT_QUIT)
                 running = false;
 
-
-            // R - Reset 
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_R)
             {
-                std::vector<float> h_f_reset(HEIGHT * WIDTH * Q);
-                for (int y = 0; y < HEIGHT; ++y) {
-                    for (int x = 0; x < WIDTH; ++x) {
-                        float r = (x < WALL_X) ? RHO_LEFT : RHO_RIGHT;
-                        h_rho[S_IDX(y, x)] = r;
-                        for (int i = 0; i < Q; ++i) {
-                            h_f_reset[F_IDX(y, x, i)] = w0[i] * r;
-                        }
+                scenario.bubble.burst = false;
+                apply_scenario(scenario, h_rho.data(), h_ux.data(), h_uy.data(),
+                               h_f.data(), h_wall, d_f_in, d_rho, d_ux, d_uy, d_wall,
+                               f_sz, sc_sz, msk_sz, stats);
+            }
+
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_TAB)
+            {
+                scenario_cycle(scenario);
+                apply_scenario(scenario, h_rho.data(), h_ux.data(), h_uy.data(),
+                               h_f.data(), h_wall, d_f_in, d_rho, d_ux, d_uy, d_wall,
+                               f_sz, sc_sz, msk_sz, stats);
+            }
+
+            if (ev.type == SDL_EVENT_KEY_DOWN)
+            {
+                if (scenario.on_key(ev.key.key, h_wall))
+                {
+                    if (scenario.id == ScenarioId::Bubble && scenario.bubble.burst)
+                    {
+                        scenario.reset_fields(h_rho.data(), h_ux.data(), h_uy.data(),
+                                              h_f.data());
+                        cudaMemcpy(d_f_in, h_f.data(), f_sz, cudaMemcpyHostToDevice);
+                        cudaMemcpy(d_rho, h_rho.data(), sc_sz, cudaMemcpyHostToDevice);
+                        cudaMemset(d_ux, 0, sc_sz);
+                        cudaMemset(d_uy, 0, sc_sz);
+                        fields_updated = true;
                     }
-                }
-                cudaMemcpy(d_f_in, h_f_reset.data(), f_sz, cudaMemcpyHostToDevice);
-                cudaMemcpy(d_rho, h_rho.data(), sc_sz, cudaMemcpyHostToDevice);
-                cudaMemset(d_ux, 0, sc_sz);
-                cudaMemset(d_uy, 0, sc_sz);
-                capture_viz_bounds(h_rho.data(), h_ux.data(), h_uy.data(), h_wall, stats);
-            }
-
-            // B - toggle closed/open boundary mode
-            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_B)
-                bc_mode = (bc_mode == BC_CLOSED) ? BC_OPEN : BC_CLOSED;
-
-            // SPACE - open/close holes
-            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_SPACE) {
-                hole_open = !hole_open;
-                update_central_wall(h_wall, d_wall, current_holes, hole_open, false);
-            }
-
-            // C - clear custom walls
-            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_C) {
-                update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
-            }
-
-            // 1-4 number of holes
-            if (ev.type == SDL_EVENT_KEY_DOWN) {
-                int new_holes = -1;
-                if (ev.key.key == SDLK_1) new_holes = 1;
-                if (ev.key.key == SDLK_2) new_holes = 2;
-                if (ev.key.key == SDLK_3) new_holes = 3;
-                if (ev.key.key == SDLK_4) new_holes = 4;
-
-                if (new_holes != -1 && new_holes != current_holes) {
-                    current_holes = new_holes;
-                    update_central_wall(h_wall, d_wall, current_holes, hole_open, false);
+                    else
+                        wall_updated = true;
+                    stats.hole_open = scenario.supports_internal_wall()
+                        && scenario.chambers.hole_open;
                 }
             }
 
-            // Draw/erase
-            if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+            {
                 if (ev.button.button == SDL_BUTTON_LEFT) is_drawing = true;
                 if (ev.button.button == SDL_BUTTON_RIGHT) is_erasing = true;
             }
-            else if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            else if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP)
+            {
                 if (ev.button.button == SDL_BUTTON_LEFT) is_drawing = false;
                 if (ev.button.button == SDL_BUTTON_RIGHT) is_erasing = false;
             }
         }
 
-        if (is_drawing || is_erasing) {
+        if (is_drawing || is_erasing)
+        {
             float mouse_x, mouse_y;
             SDL_GetMouseState(&mouse_x, &mouse_y);
-
-            // Przeliczenie pikseli na indeks siatki LBM
             int grid_x = (int)mouse_x / CELL_SIZE;
             int grid_y = (int)mouse_y / CELL_SIZE;
 
-            // Zabezpieczenie przed wyjściem myszką poza ekran
-            if (grid_x >= 0 && grid_x < WIDTH && grid_y >= 0 && grid_y < HEIGHT) {
+            if (grid_x >= 0 && grid_x < WIDTH && grid_y >= 0 && grid_y < HEIGHT)
+            {
                 int idx = S_IDX(grid_y, grid_x);
-
-                if (is_drawing && !h_wall[idx]) {
+                if (is_drawing && !h_wall[idx])
+                {
                     h_wall[idx] = true;
                     wall_updated = true;
                 }
-                else if (is_erasing && h_wall[idx]) {
+                else if (is_erasing && h_wall[idx])
+                {
                     h_wall[idx] = false;
                     wall_updated = true;
                 }
             }
         }
 
-        // Jeśli tablica ścian na procesorze się zmieniła, synchronizujemy ją z kartą graficzną
-        if (wall_updated) {
+        if (wall_updated)
             cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
+
+        if (fields_updated)
+        {
+            cudaMemcpy(d_ux, h_ux.data(), sc_sz, cudaMemcpyHostToDevice);
+            cudaMemcpy(d_uy, h_uy.data(), sc_sz, cudaMemcpyHostToDevice);
         }
 
-        // Simulation step
         k_macroscopic<<<grid2d, block2d>>>(d_f_in, d_rho, d_ux, d_uy);
-        k_collision<<<grid2d, block2d>>>(d_f_in, d_f_out, d_rho, d_ux, d_uy);
-        k_streaming<<<grid2d, block2d>>>(d_f_in, d_f_out);
+        k_collision<<<grid2d, block2d>>>(d_f_in, d_f_out, d_rho, d_ux, d_uy, d_wall);
+        k_streaming<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
+        k_wall_link_bounce_back<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
         k_wall_bounce_back<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
-        k_outer_boundary<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall, bc_mode);
+        k_outer_boundary<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
         cudaDeviceSynchronize();
 
-        // Copy scalars to host
         cudaMemcpy(h_rho.data(), d_rho, sc_sz, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_ux.data(), d_ux, sc_sz, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_uy.data(), d_uy, sc_sz, cudaMemcpyDeviceToHost);
 
-        // Per-field min/max (skip wall cells)
         float rho_min = FLT_MAX, rho_max = -FLT_MAX;
         float ux_min = FLT_MAX, ux_max = -FLT_MAX;
         float uy_min = FLT_MAX, uy_max = -FLT_MAX;
@@ -306,11 +257,8 @@ int main(int /*argc*/, char * /*argv*/[])
         stats.ux_max = ux_max;
         stats.uy_min = uy_min;
         stats.uy_max = uy_max;
-        stats.hole_open = hole_open;
-        stats.bc_closed = (bc_mode == BC_CLOSED);
         stats.step++;
 
-        // FPS (exponential moving average)
         Uint64 now = SDL_GetTicks();
         Uint64 elapsed = now - prev_ticks;
         if (elapsed > 0)
@@ -325,7 +273,6 @@ int main(int /*argc*/, char * /*argv*/[])
             SDL_Delay((Uint32)(ms_per_frame - frame_ms));
     }
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
     cudaFree(d_f_in);
     cudaFree(d_f_out);
     cudaFree(d_rho);
