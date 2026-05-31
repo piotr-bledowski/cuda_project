@@ -25,22 +25,23 @@ static Uint32 pack_argb(Uint8 r, Uint8 g, Uint8 b)
     return (0xFFu << 24) | ((Uint32)r << 16) | ((Uint32)g << 8) | b;
 }
 
-// Blue (low density) → Red (high density)
-static Uint32 rho_color(float r)
+// Blue (low density) → Red (high density), mapped to fixed viz bounds
+static Uint32 rho_color(float r, float rho_min, float rho_max)
 {
-    float t = (r - RHO_RIGHT) / (RHO_LEFT - RHO_RIGHT);
+    float span = rho_max - rho_min;
+    float t = (span > 1e-8f) ? (r - rho_min) / span : 0.5f;
     t = std::max(0.f, std::min(1.f, t));
     return pack_argb((Uint8)(255 * t), 0, (Uint8)(255 * (1.f - t)));
 }
 
-// Red = positive, Blue = negative, Black = zero
-static Uint32 vel_color(float v)
+// Red = positive, Blue = negative, Black = zero; symmetric vel_scale
+static Uint32 vel_color(float v, float vel_scale)
 {
-    float n = v / U_MAX;
+    float n = (vel_scale > 1e-8f) ? v / vel_scale : 0.f;
     n = std::max(-1.f, std::min(1.f, n));
     if (n >= 0.f)
-        return pack_argb((Uint8)(210 * n), 0, 0);
-    return pack_argb(0, 0, (Uint8)(210 * (-n)));
+        return pack_argb((Uint8)(255 * n), 0, 0);
+    return pack_argb(0, 0, (Uint8)(255 * (-n)));
 }
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
@@ -71,7 +72,8 @@ static void fill_sim_texture(SDL_Texture* tex,
                               const float* h_rho,
                               const float* h_ux,
                               const float* h_uy,
-                              const bool*  h_wall)
+                              const bool*  h_wall,
+                              const FrameStats& stats)
 {
     void* pixels; int pitch;
     SDL_LockTexture(tex, nullptr, &pixels, &pitch);
@@ -82,9 +84,12 @@ static void fill_sim_texture(SDL_Texture* tex,
     for (int y = 0; y < HEIGHT; ++y) {
         for (int x = 0; x < WIDTH; ++x) {
             bool w = h_wall[S_IDX(y, x)];
-            px[y * stride + x            ] = w ? wall_px : rho_color(h_rho[S_IDX(y, x)]);
-            px[y * stride + WIDTH   + x  ] = w ? wall_px : vel_color(h_ux [S_IDX(y, x)]);
-            px[y * stride + 2*WIDTH + x  ] = w ? wall_px : vel_color(h_uy [S_IDX(y, x)]);
+            px[y * stride + x            ] = w ? wall_px : rho_color(h_rho[S_IDX(y, x)],
+                stats.viz_rho_min, stats.viz_rho_max);
+            px[y * stride + WIDTH   + x  ] = w ? wall_px : vel_color(h_ux [S_IDX(y, x)],
+                stats.viz_vel_scale);
+            px[y * stride + 2*WIDTH + x  ] = w ? wall_px : vel_color(h_uy [S_IDX(y, x)],
+                stats.viz_vel_scale);
         }
     }
     SDL_UnlockTexture(tex);
@@ -95,7 +100,7 @@ static void fill_sim_texture(SDL_Texture* tex,
 SDL_Window* ui_create_window()
 {
     return SDL_CreateWindow(
-        "LBM CUDA  |  D2Q9 Fluid Simulation  |  [SPACE] toggle hole",
+        "LBM CUDA  |  D2Q9 Fluid Simulation  |  [SPACE] hole  [B] BC  [R] reset",
         WIN_W, WIN_H, 0);
 }
 
@@ -122,7 +127,7 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
     SDL_RenderClear(ren);
 
     // ── Simulation panels ─────────────────────────────────────────────────────
-    fill_sim_texture(tex, h_rho, h_ux, h_uy, h_wall);
+    fill_sim_texture(tex, h_rho, h_ux, h_uy, h_wall, stats);
 
     for (int p = 0; p < 3; ++p) {
         SDL_FRect src = { (float)(p * WIDTH), 0.f, (float)WIDTH, (float)HEIGHT };
@@ -171,9 +176,10 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
     txt(ren, 8.f, sy, buf);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f   Hole: %s",
+    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f   Hole: %s   BC: %s",
              (double)RHO_LEFT, (double)RHO_RIGHT,
-             stats.hole_open ? "OPEN  " : "CLOSED");
+             stats.hole_open ? "OPEN  " : "CLOSED",
+             stats.bc_closed ? "CLOSED" : "OPEN  ");
     if (stats.hole_open)
         txt(ren, 8.f, sy, buf, 255, 205, 80);
     else
@@ -220,6 +226,13 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
         snprintf(buf, sizeof(buf), "max: %+.4f", (double)maxs[p]);
         txt(ren, (float)(RX + p * COL_W), sy, buf, 255, 140, 110);
     }
+    sy += LINE_H;
+
+    snprintf(buf, sizeof(buf), "map: %.3f..%.3f", (double)stats.viz_rho_min, (double)stats.viz_rho_max);
+    txt(ren, (float)RX, sy, buf, 140, 140, 160);
+    snprintf(buf, sizeof(buf), "scale: +/-%.4f", (double)stats.viz_vel_scale);
+    txt(ren, (float)(RX + COL_W), sy, buf, 140, 140, 160);
+    txt(ren, (float)(RX + 2 * COL_W), sy, buf, 140, 140, 160);
 
     SDL_SetRenderScale(ren, 1.0f, 1.0f);
 
