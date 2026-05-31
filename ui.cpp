@@ -3,22 +3,18 @@
 #include <algorithm>
 
 // ── Layout constants ──────────────────────────────────────────────────────────
-
 // Text is rendered at 1.5× — debug chars appear as 12×12 px instead of 8×8.
 static constexpr float TEXT_SCALE = 1.5f;
 static constexpr int LINE_H = 18; // px between successive text lines
-
 // x-offsets (screen px) of the left edge of each simulation panel
 static constexpr int PANEL_X[3] = {
     0,
     PANEL_W + DIVIDER_W,
-    2 * PANEL_W + 2 * DIVIDER_W};
-
+    2 * PANEL_W + 2 * DIVIDER_W };
 // x-coordinate where the vertical divider inside the stats bar sits
 static constexpr int VSTATS_X = 458;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
-
 static Uint32 pack_argb(Uint8 r, Uint8 g, Uint8 b)
 {
     return (0xFFu << 24) | ((Uint32)r << 16) | ((Uint32)g << 8) | b;
@@ -44,12 +40,11 @@ static Uint32 vel_color(float v, float vel_scale)
 }
 
 // ── Geometry helpers ──────────────────────────────────────────────────────────
-
-static void fill_rect(SDL_Renderer *ren, int x, int y, int w, int h,
-                      Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255)
+static void fill_rect(SDL_Renderer* ren, int x, int y, int w, int h,
+    Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255)
 {
     SDL_SetRenderDrawColor(ren, r, g, b, a);
-    SDL_FRect rc = {(float)x, (float)y, (float)w, (float)h};
+    SDL_FRect rc = { (float)x, (float)y, (float)w, (float)h };
     SDL_RenderFillRect(ren, &rc);
 }
 
@@ -57,28 +52,26 @@ static void fill_rect(SDL_Renderer *ren, int x, int y, int w, int h,
 // Called while render scale is set to TEXT_SCALE.
 // sx, sy are screen-pixel coordinates; they are divided by TEXT_SCALE
 // internally so the text appears at the intended screen position.
-
-static void txt(SDL_Renderer *ren, float sx, float sy, const char *s,
-                Uint8 r = 210, Uint8 g = 210, Uint8 b = 210)
+static void txt(SDL_Renderer* ren, float sx, float sy, const char* s,
+    Uint8 r = 210, Uint8 g = 210, Uint8 b = 210)
 {
     SDL_SetRenderDrawColor(ren, r, g, b, 255);
     SDL_RenderDebugText(ren, sx / TEXT_SCALE, sy / TEXT_SCALE, s);
 }
 
 // ── Simulation texture ────────────────────────────────────────────────────────
-
-static void fill_sim_texture(SDL_Texture *tex,
-                             const float *h_rho,
-                             const float *h_ux,
-                             const float *h_uy,
-                             const bool *h_wall,
-                             const FrameStats &stats)
+static void fill_sim_texture(SDL_Texture* tex,
+    const float* h_rho,
+    const float* h_ux,
+    const float* h_uy,
+    const bool* h_wall,
+    const FrameStats& stats)
 {
-    void *pixels;
+    void* pixels;
     int pitch;
     SDL_LockTexture(tex, nullptr, &pixels, &pitch);
     int stride = pitch / (int)sizeof(Uint32);
-    Uint32 *px = (Uint32 *)pixels;
+    Uint32* px = (Uint32*)pixels;
 
     const Uint32 wall_px = pack_argb(220, 220, 220);
     for (int y = 0; y < HEIGHT; ++y)
@@ -96,30 +89,30 @@ static void fill_sim_texture(SDL_Texture *tex,
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-SDL_Window *ui_create_window()
+SDL_Window* ui_create_window()
 {
     return SDL_CreateWindow(
-        "LBM CUDA  |  D2Q9 Fluid Simulation  |  [SPACE] hole  [B] BC  [R] reset",
+        "LBM CUDA  |  [Q/W/E] modes  [C] clear  [R] reset  [SPACE] hole  [B] BC",
         WIN_W, WIN_H, 0);
 }
 
-SDL_Renderer *ui_create_renderer(SDL_Window *win)
+SDL_Renderer* ui_create_renderer(SDL_Window* win)
 {
-    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
+    SDL_Renderer* ren = SDL_CreateRenderer(win, NULL);
     SDL_SetRenderVSync(ren, 1);
     return ren;
 }
 
-SDL_Texture *ui_create_sim_texture(SDL_Renderer *ren)
+SDL_Texture* ui_create_sim_texture(SDL_Renderer* ren)
 {
     return SDL_CreateTexture(ren,
-                             SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-                             WIDTH * 3, HEIGHT);
+        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+        WIDTH * 3, HEIGHT);
 }
 
-void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
-                   const float *h_rho, const float *h_ux, const float *h_uy,
-                   const bool *h_wall, const FrameStats &stats)
+void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
+    const float* h_rho, const float* h_ux, const float* h_uy,
+    const bool* h_wall, const FrameStats& stats)
 {
     // ── Background ────────────────────────────────────────────────────────────
     SDL_SetRenderDrawColor(ren, 22, 22, 26, 255);
@@ -130,8 +123,8 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
 
     for (int p = 0; p < 3; ++p)
     {
-        SDL_FRect src = {(float)(p * WIDTH), 0.f, (float)WIDTH, (float)HEIGHT};
-        SDL_FRect dst = {(float)PANEL_X[p], 0.f, (float)PANEL_W, (float)PANEL_H};
+        SDL_FRect src = { (float)(p * WIDTH), 0.f, (float)WIDTH, (float)HEIGHT };
+        SDL_FRect dst = { (float)PANEL_X[p], 0.f, (float)PANEL_W, (float)PANEL_H };
         SDL_RenderTexture(ren, tex, &src, &dst);
     }
 
@@ -144,7 +137,7 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
     for (int p = 0; p < 3; ++p)
     {
         SDL_SetRenderDrawColor(ren, 12, 12, 40, 215);
-        SDL_FRect hbar = {(float)PANEL_X[p], 0.f, (float)PANEL_W, 26.f};
+        SDL_FRect hbar = { (float)PANEL_X[p], 0.f, (float)PANEL_W, 26.f };
         SDL_RenderFillRect(ren, &hbar);
     }
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
@@ -160,7 +153,7 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
     SDL_SetRenderScale(ren, TEXT_SCALE, TEXT_SCALE);
 
     // Panel header labels
-    const char *hlabels[3] = {"DENSITY", "VEL X", "VEL Y"};
+    const char* hlabels[3] = { "DENSITY", "VEL X", "VEL Y" };
     for (int p = 0; p < 3; ++p)
         txt(ren, (float)(PANEL_X[p] + 8), 8.f, hlabels[p], 170, 170, 255);
 
@@ -169,19 +162,19 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
     float sy = (float)(PANEL_H + 10);
 
     snprintf(buf, sizeof(buf), "FPS: %.1f   SPS: %.0f   Step: %d   (%d st/fr)",
-             (double)stats.fps, (double)stats.sps, stats.step, stats.steps_per_frame);
+        (double)stats.fps, (double)stats.sps, stats.step, stats.steps_per_frame);
     txt(ren, 8.f, sy, buf, 230, 230, 230);
     sy += LINE_H;
 
     snprintf(buf, sizeof(buf), "Grid: %dx%d   TAU: %.2f   nu: %.4f",
-             WIDTH, HEIGHT, (double)TAU, (double)stats.nu);
+        WIDTH, HEIGHT, (double)TAU, (double)stats.nu);
     txt(ren, 8.f, sy, buf);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f   Hole: %s   BC: %s",
-             (double)RHO_LEFT, (double)RHO_RIGHT,
-             stats.hole_open ? "OPEN  " : "CLOSED",
-             stats.bc_closed ? "CLOSED" : "OPEN  ");
+    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f     Hole: %s     BC: %s",
+        (double)RHO_LEFT, (double)RHO_RIGHT,
+        stats.hole_open ? "OPEN  " : "CLOSED",
+        stats.bc_closed ? "CLOSED" : "OPEN  ");
     if (stats.hole_open)
         txt(ren, 8.f, sy, buf, 255, 205, 80);
     else
@@ -193,8 +186,8 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
     sy += LINE_H;
 
     snprintf(buf, sizeof(buf), "Kernels: %dx%d blk x %dx%d thr  =  %d threads",
-             stats.grid_x, stats.grid_y, stats.block_x, stats.block_y,
-             stats.grid_x * stats.grid_y * stats.block_x * stats.block_y);
+        stats.grid_x, stats.grid_y, stats.block_x, stats.block_y,
+        stats.grid_x * stats.grid_y * stats.block_x * stats.block_y);
     txt(ren, 8.f, sy, buf);
     sy += LINE_H;
 
@@ -205,9 +198,9 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
     const int RX = VSTATS_X + 10;
     const int COL_W = (WIN_W - RX) / 3;
 
-    const char *pnames[3] = {"DENSITY (LBM)", "VEL X (lu/ts)", "VEL Y (lu/ts)"};
-    float mins[3] = {stats.rho_min, stats.ux_min, stats.uy_min};
-    float maxs[3] = {stats.rho_max, stats.ux_max, stats.uy_max};
+    const char* pnames[3] = { "DENSITY (LBM)", "VEL X (lu/ts)", "VEL Y (lu/ts)" };
+    float mins[3] = { stats.rho_min, stats.ux_min, stats.uy_min };
+    float maxs[3] = { stats.rho_max, stats.ux_max, stats.uy_max };
 
     // Vertical alignment guides in stats area (subtle, aligned with panel centres)
     // (drawn after texture, before text — kept as text overlay for simplicity)
