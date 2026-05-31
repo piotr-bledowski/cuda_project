@@ -7,7 +7,7 @@
 static constexpr int DIVIDER_W = 4;               // px between panels
 static constexpr int PANEL_W   = WIDTH  * CELL_SIZE;
 static constexpr int PANEL_H   = HEIGHT * CELL_SIZE;
-static constexpr int STATS_H   = 125;             // stats bar height
+static constexpr int STATS_H   = 168;             // stats bar height (3 aligned columns)
 static constexpr int WIN_W     = 3 * PANEL_W + 2 * DIVIDER_W;
 static constexpr int WIN_H     = PANEL_H + STATS_H;
 
@@ -29,6 +29,7 @@ struct FrameStats {
     char  gpu_name[256];
     bool  hole_open;
     bool  bc_closed;           // true = closed mixing box, false = open reservoirs
+    bool  sim_paused;
     int   step;
     float nu;                  // kinematic viscosity = (TAU-0.5)/3
 };

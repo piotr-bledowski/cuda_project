@@ -15,20 +15,28 @@ __global__ void k_macroscopic(const float* __restrict__ f_in,
 // Step 1 — fused macroscopic + BGK collision
 //   Computes ρ and u in registers (no global write), outputs post-collision f_out.
 __global__ void k_collide(const float* __restrict__ f_in,
-                           float* __restrict__ f_out);
+                           float* __restrict__ f_out,
+                           const bool* __restrict__ wall);
 
 // Step 2 — pull streaming with shared-memory tile
 //   Loads a (TILE_DIM × TILE_DIM) tile of f_out (post-collision) into shared
 //   memory and pulls all 9 directions from it, avoiding repeated global reads.
+//   Skips links whose source is a wall (filled by k_wall_link_bounce_back).
 __global__ void k_streaming_shmem(float* __restrict__ f_in,
-                                   const float* __restrict__ f_out);
+                                   const float* __restrict__ f_out,
+                                   const bool* __restrict__ wall);
 
-// Step 3 — bounce-back on interior wall nodes
+// Step 3 — bounce-back on fluid nodes adjacent to walls (prevents barrier leak)
+__global__ void k_wall_link_bounce_back(float* __restrict__ f_in,
+                                         const float* __restrict__ f_out,
+                                         const bool* __restrict__ wall);
+
+// Step 4 — bounce-back on interior wall nodes
 __global__ void k_wall_bounce_back(float* __restrict__ f_in,
                                     const float* __restrict__ f_out,
                                     const bool* __restrict__ wall);
 
-// Step 4 — outer BC: bounce-back (closed) or Zou-He (open) on west/east
+// Step 5 — outer BC: bounce-back (closed) or Zou-He (open) on west/east
 __global__ void k_outer_boundary(float* __restrict__ f_in,
                                   const float* __restrict__ f_out,
                                   const bool* __restrict__ wall,
