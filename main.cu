@@ -14,11 +14,35 @@
 
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <cmath>
 #include <vector>
 #include <algorithm>
 #include "sim_params.h"
 #include "kernels.cuh"
 #include "ui.h"
+
+
+static void capture_viz_bounds(const float* h_rho,
+                               const float* h_ux,
+                               const float* h_uy,
+                               const bool*  h_wall,
+                               FrameStats&  stats)
+{
+    float rho_min = FLT_MAX, rho_max = -FLT_MAX;
+    float vel_max = 0.f;
+    for (int i = 0; i < HEIGHT * WIDTH; ++i)
+    {
+        if (h_wall[i])
+            continue;
+        rho_min = std::min(rho_min, h_rho[i]);
+        rho_max = std::max(rho_max, h_rho[i]);
+        vel_max = std::max(vel_max, std::fabs(h_ux[i]));
+        vel_max = std::max(vel_max, std::fabs(h_uy[i]));
+    }
+    stats.viz_rho_min = rho_min;
+    stats.viz_rho_max = rho_max;
+    stats.viz_vel_scale = std::max(vel_max, U_MAX * 0.05f);
+}
 
 
 void update_central_wall(bool* h_wall, bool* d_wall, int num_holes, bool is_open, bool wipe_board) {
@@ -112,6 +136,7 @@ int main(int /*argc*/, char * /*argv*/[])
     cudaMemset(d_uy, 0, sc_sz);
 
     bool hole_open = true;
+    int  bc_mode = BC_CLOSED;
 
     int current_holes = 1;
     int current_hole_size = 10;
@@ -137,6 +162,7 @@ int main(int /*argc*/, char * /*argv*/[])
     stats.occupancy_pct = occupancy;
     stats.nu = (TAU - 0.5f) / 3.f;
     snprintf(stats.gpu_name, sizeof(stats.gpu_name), "%s", devProp.name);
+    capture_viz_bounds(h_rho.data(), h_ux.data(), h_uy.data(), h_wall, stats);
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     const Uint64 ms_per_frame = 1000u / TARGET_FPS;
@@ -173,9 +199,14 @@ int main(int /*argc*/, char * /*argv*/[])
                 }
                 cudaMemcpy(d_f_in, h_f_reset.data(), f_sz, cudaMemcpyHostToDevice);
                 cudaMemcpy(d_rho, h_rho.data(), sc_sz, cudaMemcpyHostToDevice);
-                cudaMemset(d_ux, 0, sc_sz); 
+                cudaMemset(d_ux, 0, sc_sz);
                 cudaMemset(d_uy, 0, sc_sz);
+                capture_viz_bounds(h_rho.data(), h_ux.data(), h_uy.data(), h_wall, stats);
             }
+
+            // B - toggle closed/open boundary mode
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_B)
+                bc_mode = (bc_mode == BC_CLOSED) ? BC_OPEN : BC_CLOSED;
 
             // SPACE - open/close holes
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_SPACE) {
@@ -243,11 +274,10 @@ int main(int /*argc*/, char * /*argv*/[])
 
         // Simulation step
         k_macroscopic<<<grid2d, block2d>>>(d_f_in, d_rho, d_ux, d_uy);
-        k_clamp_velocity<<<grid2d, block2d>>>(d_ux, d_uy); // keep |u| ≤ U_MAX
         k_collision<<<grid2d, block2d>>>(d_f_in, d_f_out, d_rho, d_ux, d_uy);
         k_streaming<<<grid2d, block2d>>>(d_f_in, d_f_out);
         k_wall_bounce_back<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
-        k_outer_boundary<<<grid2d, block2d>>>(d_f_in, d_f_out);
+        k_outer_boundary<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall, bc_mode);
         cudaDeviceSynchronize();
 
         // Copy scalars to host
@@ -277,6 +307,7 @@ int main(int /*argc*/, char * /*argv*/[])
         stats.uy_min = uy_min;
         stats.uy_max = uy_max;
         stats.hole_open = hole_open;
+        stats.bc_closed = (bc_mode == BC_CLOSED);
         stats.step++;
 
         // FPS (exponential moving average)

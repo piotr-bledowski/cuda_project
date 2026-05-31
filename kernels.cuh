@@ -26,13 +26,11 @@ __global__ void k_wall_bounce_back(float* __restrict__ f_in,
                                     const float* __restrict__ f_out,
                                     const bool* __restrict__ wall);
 
-// Step 5 — Zou-He pressure BC (left/right), bounce-back (top/bottom)
+// Step 5 — outer BC: bounce-back (closed) or Zou-He (open) on west/east
 __global__ void k_outer_boundary(float* __restrict__ f_in,
-                                  const float* __restrict__ f_out);
-
-// Step 1b — clamp velocity magnitude to U_MAX (called after k_macroscopic)
-__global__ void k_clamp_velocity(float* __restrict__ ux,
-                                  float* __restrict__ uy);
+                                  const float* __restrict__ f_out,
+                                  const bool* __restrict__ wall,
+                                  int bc_mode);
 
 // ── CPU helper ────────────────────────────────────────────────────────────────
 void rebuild_wall(bool* h_wall, bool* d_wall, bool hole_open);
