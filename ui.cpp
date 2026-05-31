@@ -168,7 +168,8 @@ void ui_draw_frame(SDL_Renderer *ren, SDL_Texture *tex,
     char buf[256];
     float sy = (float)(PANEL_H + 10);
 
-    snprintf(buf, sizeof(buf), "FPS: %.1f     Step: %d", stats.fps, stats.step);
+    snprintf(buf, sizeof(buf), "FPS: %.1f   SPS: %.0f   Step: %d   (%d st/fr)",
+             (double)stats.fps, (double)stats.sps, stats.step, stats.steps_per_frame);
     txt(ren, 8.f, sy, buf, 230, 230, 230);
     sy += LINE_H;
 

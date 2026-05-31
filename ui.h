@@ -15,6 +15,8 @@ static constexpr int WIN_H     = PANEL_H + STATS_H;
 
 struct FrameStats {
     float fps;
+    float sps;                 // simulation steps per second (= steps_per_frame * FPS)
+    int   steps_per_frame;     // LBM substeps per rendered frame (CLI -n)
     float rho_min, rho_max;
     float ux_min,  ux_max;
     float uy_min,  uy_max;

@@ -9,6 +9,14 @@
 #define CELL_SIZE 5
 #define TARGET_FPS 60
 
+// ── Simulation defaults (override at runtime via CLI: -n N or positional N) ─
+#define DEFAULT_STEPS_PER_FRAME 16
+
+// ── Kernel launch geometry ───────────────────────────────────────────────────
+// Must match dim3 block2d(BLOCK_DIM, BLOCK_DIM) in main.cu.
+#define BLOCK_DIM 16
+#define TILE_DIM  (BLOCK_DIM + 2)   // shared-memory tile including 1-cell halo
+
 // ── Physics ──────────────────────────────────────────────────────────────────
 #define TAU 1.0f
 #define RHO_LEFT 1.15f // ≤ 30% contrast keeps D2Q9 in the low-Mach regime

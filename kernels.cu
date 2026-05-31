@@ -69,6 +69,100 @@ __global__ void k_collision(const float* __restrict__ f_in,
     }
 }
 
+// ── Fused macroscopic + BGK collision ─────────────────────────────────────────
+// Replaces the separate k_macroscopic + k_collision pair for the inner loop.
+// ρ and u are computed entirely in registers — no global write of scalar fields.
+__global__ void k_collide(const float* __restrict__ f_in,
+                           float* __restrict__ f_out)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= WIDTH || y >= HEIGHT) return;
+
+    float fi[Q];
+    float r = 0.f, vx = 0.f, vy = 0.f;
+    #pragma unroll
+    for (int i = 0; i < Q; ++i) {
+        fi[i] = f_in[F_IDX(y, x, i)];
+        r  += fi[i];
+        vx += (float)d_cx[i] * fi[i];
+        vy += (float)d_cy[i] * fi[i];
+    }
+    float inv_r = (r > 1e-10f) ? 1.f / r : 0.f;
+    vx *= inv_r;
+    vy *= inv_r;
+    float u2    = vx * vx + vy * vy;
+    float omega = 1.f / TAU;
+    #pragma unroll
+    for (int i = 0; i < Q; ++i) {
+        float cu  = (float)d_cx[i] * vx + (float)d_cy[i] * vy;
+        float feq = d_w[i] * r * (1.f + 3.f*cu + 4.5f*cu*cu - 1.5f*u2);
+        f_out[F_IDX(y, x, i)] = fi[i] + omega * (feq - fi[i]);
+    }
+}
+
+// ── Pull streaming with shared-memory tile ────────────────────────────────────
+// Each block cooperatively loads a (TILE_DIM × TILE_DIM) patch of f_out
+// (post-collision) into shared memory, then every thread pulls all 9 directions
+// from shared memory instead of making 9 separate global reads.
+//
+// For a 16×16 block the tile is 18×18.  With D2Q9 offsets ∈ {-1,0,+1}², the
+// source of every direction always falls inside the 18×18 tile, so no global
+// fallback is needed for interior cells.  Out-of-domain directions are skipped
+// (same behaviour as k_streaming); k_outer_boundary fills them afterwards.
+//
+// Shared memory: 18 × 18 × 9 × 4 B = 11,664 B ≈ 11.4 KB per block.
+// Bank access: stride between consecutive threads = Q = 9, which is coprime
+// with 32 → no bank conflicts in either half-warp.
+__global__ void k_streaming_shmem(float* __restrict__ f_in,
+                                   const float* __restrict__ f_out)
+{
+    const int tx = threadIdx.x;   // 0 .. BLOCK_DIM-1
+    const int ty = threadIdx.y;
+    const int x  = blockIdx.x * BLOCK_DIM + tx;
+    const int y  = blockIdx.y * BLOCK_DIM + ty;
+
+    // Tile origin in global coords (one cell to the top-left of the block).
+    const int x_base = blockIdx.x * BLOCK_DIM - 1;
+    const int y_base = blockIdx.y * BLOCK_DIM - 1;
+
+    __shared__ float s[TILE_DIM][TILE_DIM][Q];  // 18 × 18 × 9
+
+    // ── Cooperative tile load ────────────────────────────────────────────────
+    // 256 threads fill 18*18 = 324 cells; each thread handles 1 or 2 cells.
+    const int tid    = ty * BLOCK_DIM + tx;
+    const int n_cell = TILE_DIM * TILE_DIM;   // 324
+    for (int idx = tid; idx < n_cell; idx += BLOCK_DIM * BLOCK_DIM) {
+        int hy = idx / TILE_DIM;
+        int hx = idx % TILE_DIM;
+        int gx = x_base + hx;
+        int gy = y_base + hy;
+        if (gx >= 0 && gx < WIDTH && gy >= 0 && gy < HEIGHT) {
+            #pragma unroll
+            for (int i = 0; i < Q; ++i)
+                s[hy][hx][i] = f_out[F_IDX(gy, gx, i)];
+        } else {
+            #pragma unroll
+            for (int i = 0; i < Q; ++i)
+                s[hy][hx][i] = 0.f;
+        }
+    }
+    __syncthreads();
+
+    if (x >= WIDTH || y >= HEIGHT) return;
+
+    // ── Pull streaming from shared memory ────────────────────────────────────
+    #pragma unroll
+    for (int i = 0; i < Q; ++i) {
+        int gsx = x - d_cx[i];
+        int gsy = y - d_cy[i];
+        if (gsx < 0 || gsx >= WIDTH || gsy < 0 || gsy >= HEIGHT)
+            continue;   // out-of-domain: k_outer_boundary handles this direction
+        // Source local coords in the tile (always 0..TILE_DIM-1 for BLOCK_DIM=16)
+        f_in[F_IDX(y, x, i)] = s[ty + 1 - d_cy[i]][tx + 1 - d_cx[i]][i];
+    }
+}
+
 __global__ void k_streaming(float* __restrict__ f_in,
                              const float* __restrict__ f_out)
 {

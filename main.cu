@@ -9,17 +9,80 @@
  *   sim_params.h  — grid constants, index macros
  *   kernels.cuh/cu — CUDA kernels + rebuild_wall
  *   ui.h/cpp      — SDL window, rendering, stats overlay
- *   main.cu       — simulation loop (this file)
+ *   main.cu       — simulation loop, CLI (-n steps per frame)
  */
 
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 #include "sim_params.h"
 #include "kernels.cuh"
 #include "ui.h"
+
+
+static void print_usage(const char* prog)
+{
+    fprintf(stderr,
+        "Usage: %s [options] [steps]\n"
+        "\n"
+        "  -n, --steps N   LBM substeps per rendered frame (default %d)\n"
+        "  -h, --help      Show this help\n"
+        "\n"
+        "Examples:\n"
+        "  %s              %d steps per frame\n"
+        "  %s 32           32 steps per frame\n"
+        "  %s -n 64\n"
+        "\n",
+        prog, DEFAULT_STEPS_PER_FRAME,
+        prog, DEFAULT_STEPS_PER_FRAME,
+        prog, prog);
+}
+
+static int parse_steps_per_frame(int argc, char** argv)
+{
+    int steps = DEFAULT_STEPS_PER_FRAME;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+        if (std::strcmp(argv[i], "-n") == 0 || std::strcmp(argv[i], "--steps") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s requires a value\n", argv[i]);
+                print_usage(argv[0]);
+                std::exit(1);
+            }
+            char* end = nullptr;
+            long v = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 1) {
+                fprintf(stderr, "error: invalid step count '%s'\n", argv[i]);
+                std::exit(1);
+            }
+            steps = (int)v;
+            continue;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            print_usage(argv[0]);
+            std::exit(1);
+        }
+        char* end = nullptr;
+        long v = std::strtol(argv[i], &end, 10);
+        if (end == argv[i] || *end != '\0' || v < 1) {
+            fprintf(stderr, "error: invalid step count '%s'\n", argv[i]);
+            print_usage(argv[0]);
+            std::exit(1);
+        }
+        steps = (int)v;
+    }
+    return steps;
+}
 
 
 static void capture_viz_bounds(const float* h_rho,
@@ -79,8 +142,11 @@ void update_central_wall(bool* h_wall, bool* d_wall, int num_holes, bool is_open
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-int main(int /*argc*/, char * /*argv*/[])
+int main(int argc, char* argv[])
 {
+    const int steps_per_frame = parse_steps_per_frame(argc, argv);
+    fprintf(stderr, "LBM: %d step(s) per frame (use -h for help)\n", steps_per_frame);
+
     // ── SDL setup ─────────────────────────────────────────────────────────────
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
@@ -146,14 +212,16 @@ int main(int /*argc*/, char * /*argv*/[])
     const dim3 block2d(16, 16);
     const dim3 grid2d((WIDTH + 15) / 16, (HEIGHT + 15) / 16);
 
-    // Theoretical occupancy for the most compute-heavy kernel
+    // Theoretical occupancy — query k_streaming_shmem as it uses the most shmem
     int maxActiveBlocks = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, k_macroscopic, block2d.x * block2d.y, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, k_streaming_shmem, block2d.x * block2d.y, 0);
     float occupancy = 100.f * (maxActiveBlocks * block2d.x * block2d.y) / (float)devProp.maxThreadsPerMultiProcessor;
 
     // ── Stats struct ──────────────────────────────────────────────────────────
     FrameStats stats = {};
     stats.fps = (float)TARGET_FPS;
+    stats.sps = (float)(TARGET_FPS * steps_per_frame);
+    stats.steps_per_frame = steps_per_frame;
     stats.grid_x = (int)grid2d.x;
     stats.grid_y = (int)grid2d.y;
     stats.block_x = (int)block2d.x;
@@ -272,15 +340,21 @@ int main(int /*argc*/, char * /*argv*/[])
             cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
         }
 
-        // Simulation step
+        // ── Simulation: steps_per_frame substeps before each render ──────────
+        // k_collide (fused macro+collision) + k_streaming_shmem (tiled pull)
+        // run back-to-back with no device sync between steps.
+        // Wall bounce-back and outer BC follow each streaming step.
+        for (int sub = 0; sub < steps_per_frame; ++sub) {
+            k_collide          <<<grid2d, block2d>>>(d_f_in, d_f_out);
+            k_streaming_shmem  <<<grid2d, block2d>>>(d_f_in, d_f_out);
+            k_wall_bounce_back <<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
+            k_outer_boundary   <<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall, bc_mode);
+        }
+        // Extract macroscopic fields once per frame for visualisation
         k_macroscopic<<<grid2d, block2d>>>(d_f_in, d_rho, d_ux, d_uy);
-        k_collision<<<grid2d, block2d>>>(d_f_in, d_f_out, d_rho, d_ux, d_uy);
-        k_streaming<<<grid2d, block2d>>>(d_f_in, d_f_out);
-        k_wall_bounce_back<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall);
-        k_outer_boundary<<<grid2d, block2d>>>(d_f_in, d_f_out, d_wall, bc_mode);
         cudaDeviceSynchronize();
 
-        // Copy scalars to host
+        // Copy scalars to host (single D2H per frame)
         cudaMemcpy(h_rho.data(), d_rho, sc_sz, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_ux.data(), d_ux, sc_sz, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_uy.data(), d_uy, sc_sz, cudaMemcpyDeviceToHost);
@@ -308,13 +382,16 @@ int main(int /*argc*/, char * /*argv*/[])
         stats.uy_max = uy_max;
         stats.hole_open = hole_open;
         stats.bc_closed = (bc_mode == BC_CLOSED);
-        stats.step++;
+        stats.step += steps_per_frame;
 
-        // FPS (exponential moving average)
+        // FPS and SPS — exponential moving average over frames
         Uint64 now = SDL_GetTicks();
         Uint64 elapsed = now - prev_ticks;
-        if (elapsed > 0)
-            stats.fps = stats.fps * 0.9f + 0.1f * (1000.f / (float)elapsed);
+        if (elapsed > 0) {
+            float measured_fps = 1000.f / (float)elapsed;
+            stats.fps = stats.fps * 0.9f + 0.1f * measured_fps;
+            stats.sps = stats.sps * 0.9f + 0.1f * (steps_per_frame * measured_fps);
+        }
         prev_ticks = now;
 
         ui_draw_frame(ren, tex, h_rho.data(), h_ux.data(), h_uy.data(),
