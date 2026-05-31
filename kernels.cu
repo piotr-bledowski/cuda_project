@@ -46,24 +46,6 @@ __global__ void k_macroscopic(const float* __restrict__ f_in,
     uy [S_IDX(y, x)]  = vy * inv_r;
 }
 
-__global__ void k_clamp_velocity(float* __restrict__ ux,
-                                  float* __restrict__ uy)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= WIDTH || y >= HEIGHT) return;
-
-    int idx  = S_IDX(y, x);
-    float vx = ux[idx];
-    float vy = uy[idx];
-    float u2 = vx * vx + vy * vy;
-    if (u2 > U_MAX * U_MAX) {
-        float scale = U_MAX * rsqrtf(u2);
-        ux[idx] = vx * scale;
-        uy[idx] = vy * scale;
-    }
-}
-
 __global__ void k_collision(const float* __restrict__ f_in,
                              float* __restrict__ f_out,
                              const float* __restrict__ rho,
@@ -96,9 +78,12 @@ __global__ void k_streaming(float* __restrict__ f_in,
 
     #pragma unroll
     for (int i = 0; i < Q; ++i) {
-        int sx = (x - d_cx[i] + WIDTH)  % WIDTH;
-        int sy = (y - d_cy[i] + HEIGHT) % HEIGHT;
-        f_in[F_IDX(y, x, i)] = f_out[F_IDX(sy, sx, i)];
+        int sx = x - d_cx[i];
+        int sy = y - d_cy[i];
+        // Non-periodic: only pull from interior neighbors; boundary
+        // directions are filled by k_outer_boundary (prevents left↔right leak).
+        if (sx >= 0 && sx < WIDTH && sy >= 0 && sy < HEIGHT)
+            f_in[F_IDX(y, x, i)] = f_out[F_IDX(sy, sx, i)];
     }
 }
 
@@ -116,52 +101,77 @@ __global__ void k_wall_bounce_back(float* __restrict__ f_in,
         f_in[F_IDX(y, x, i)] = f_out[F_IDX(y, x, d_opp[i])];
 }
 
-// Zou-He pressure BC on west/east; bounce-back on north/south.
+// Outer BC: closed container uses bounce-back for every direction that
+// would stream in from outside the domain (handles edges and corners uniformly).
+// Open mode keeps Zou-He reservoirs on west/east.
 __global__ void k_outer_boundary(float* __restrict__ f_in,
-                                  const float* __restrict__ f_out)
+                                  const float* __restrict__ f_out,
+                                  const bool* __restrict__ wall,
+                                  int bc_mode)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= WIDTH || y >= HEIGHT) return;
 
-    if (x == 0) {
-        float f0 = f_in[F_IDX(y, 0, 0)];
-        float f2 = f_in[F_IDX(y, 0, 2)];
-        float f3 = f_in[F_IDX(y, 0, 3)];
-        float f4 = f_in[F_IDX(y, 0, 4)];
-        float f6 = f_in[F_IDX(y, 0, 6)];
-        float f7 = f_in[F_IDX(y, 0, 7)];
-        float rho = RHO_LEFT;
-        float ux  = 1.f - (f0 + f2 + f4 + 2.f * (f3 + f6 + f7)) / rho;
-        float uy  = (f3 + f6 - f4 - f7) / rho;
-        f_in[F_IDX(y, 0, 1)] = f3 + (2.f / 3.f) * rho * ux;
-        f_in[F_IDX(y, 0, 5)] = f7 + 0.5f * (f4 - f2) + (1.f / 6.f) * rho * ux + 0.5f * rho * uy;
-        f_in[F_IDX(y, 0, 8)] = f6 + 0.5f * (f2 - f4) + (1.f / 6.f) * rho * ux - 0.5f * rho * uy;
+    const bool is_wall = wall[S_IDX(y, x)];
+    if (is_wall) return;
+
+    const bool on_west  = (x == 0);
+    const bool on_east  = (x == WIDTH - 1);
+    const bool on_south = (y == 0);
+    const bool on_north = (y == HEIGHT - 1);
+    if (!on_west && !on_east && !on_south && !on_north) return;
+
+    if (bc_mode == BC_OPEN && (on_west || on_east)) {
+        if (on_west) {
+            float f0 = f_in[F_IDX(y, 0, 0)];
+            float f2 = f_in[F_IDX(y, 0, 2)];
+            float f3 = f_in[F_IDX(y, 0, 3)];
+            float f4 = f_in[F_IDX(y, 0, 4)];
+            float f6 = f_in[F_IDX(y, 0, 6)];
+            float f7 = f_in[F_IDX(y, 0, 7)];
+            float rho = RHO_LEFT;
+            float ux  = 1.f - (f0 + f2 + f4 + 2.f * (f3 + f6 + f7)) / rho;
+            float uy  = (f3 + f6 - f4 - f7) / rho;
+            f_in[F_IDX(y, 0, 1)] = f3 + (2.f / 3.f) * rho * ux;
+            f_in[F_IDX(y, 0, 5)] = f7 + 0.5f * (f4 - f2) + (1.f / 6.f) * rho * ux + 0.5f * rho * uy;
+            f_in[F_IDX(y, 0, 8)] = f6 + 0.5f * (f2 - f4) + (1.f / 6.f) * rho * ux - 0.5f * rho * uy;
+        }
+        if (on_east) {
+            int xm = WIDTH - 1;
+            float f0 = f_in[F_IDX(y, xm, 0)];
+            float f1 = f_in[F_IDX(y, xm, 1)];
+            float f3 = f_in[F_IDX(y, xm, 3)];
+            float f4 = f_in[F_IDX(y, xm, 4)];
+            float f5 = f_in[F_IDX(y, xm, 5)];
+            float f8 = f_in[F_IDX(y, xm, 8)];
+            float rho = RHO_RIGHT;
+            float ux  = -1.f + (f0 + f1 + f3 + 2.f * (f4 + f5 + f8)) / rho;
+            float uy  = (f4 + f5 - f3 - f8) / rho;
+            f_in[F_IDX(y, xm, 2)] = f4 - (2.f / 3.f) * rho * ux;
+            f_in[F_IDX(y, xm, 6)] = f8 + 0.5f * (f3 - f1) - (1.f / 6.f) * rho * ux + 0.5f * rho * uy;
+            f_in[F_IDX(y, xm, 7)] = f5 + 0.5f * (f1 - f3) - (1.f / 6.f) * rho * ux - 0.5f * rho * uy;
+        }
+        // Bounce-back for remaining exterior directions (corners, north/south)
+        #pragma unroll
+        for (int i = 1; i < Q; ++i) {
+            if (on_west  && (i == 1 || i == 5 || i == 8)) continue;
+            if (on_east  && (i == 2 || i == 6 || i == 7)) continue;
+            int sx = x - d_cx[i];
+            int sy = y - d_cy[i];
+            if (sx < 0 || sx >= WIDTH || sy < 0 || sy >= HEIGHT)
+                f_in[F_IDX(y, x, i)] = f_out[F_IDX(y, x, d_opp[i])];
+        }
+        return;
     }
-    if (x == WIDTH - 1) {
-        int xm = WIDTH - 1;
-        float f0 = f_in[F_IDX(y, xm, 0)];
-        float f1 = f_in[F_IDX(y, xm, 1)];
-        float f3 = f_in[F_IDX(y, xm, 3)];
-        float f4 = f_in[F_IDX(y, xm, 4)];
-        float f5 = f_in[F_IDX(y, xm, 5)];
-        float f8 = f_in[F_IDX(y, xm, 8)];
-        float rho = RHO_RIGHT;
-        float ux  = -1.f + (f0 + f1 + f3 + 2.f * (f4 + f5 + f8)) / rho;
-        float uy  = (f4 + f5 - f3 - f8) / rho;
-        f_in[F_IDX(y, xm, 2)] = f4 - (2.f / 3.f) * rho * ux;
-        f_in[F_IDX(y, xm, 6)] = f8 + 0.5f * (f3 - f1) - (1.f / 6.f) * rho * ux + 0.5f * rho * uy;
-        f_in[F_IDX(y, xm, 7)] = f5 + 0.5f * (f1 - f3) - (1.f / 6.f) * rho * ux - 0.5f * rho * uy;
-    }
-    if (y == 0) {
-        f_in[F_IDX(0, x, 3)] = f_out[F_IDX(0, x, 4)];
-        f_in[F_IDX(0, x, 5)] = f_out[F_IDX(0, x, 8)];
-        f_in[F_IDX(0, x, 6)] = f_out[F_IDX(0, x, 7)];
-    }
-    if (y == HEIGHT - 1) {
-        f_in[F_IDX(HEIGHT-1, x, 4)] = f_out[F_IDX(HEIGHT-1, x, 3)];
-        f_in[F_IDX(HEIGHT-1, x, 8)] = f_out[F_IDX(HEIGHT-1, x, 5)];
-        f_in[F_IDX(HEIGHT-1, x, 7)] = f_out[F_IDX(HEIGHT-1, x, 6)];
+
+    // Closed container: bounce-back every population arriving from outside
+    #pragma unroll
+    for (int i = 1; i < Q; ++i) {
+        int sx = x - d_cx[i];
+        int sy = y - d_cy[i];
+        if (sx < 0 || sx >= WIDTH || sy < 0 || sy >= HEIGHT)
+            f_in[F_IDX(y, x, i)] = f_out[F_IDX(y, x, d_opp[i])];
     }
 }
 

@@ -18,12 +18,15 @@ struct FrameStats {
     float rho_min, rho_max;
     float ux_min,  ux_max;
     float uy_min,  uy_max;
+    float viz_rho_min, viz_rho_max; // fixed colormap bounds (captured at reset)
+    float viz_vel_scale;            // symmetric |u| scale for velocity panels
     int   grid_x,  grid_y;    // kernel launch grid (in blocks)
     int   block_x, block_y;   // threads per block
     int   sm_count;
     float occupancy_pct;
     char  gpu_name[256];
     bool  hole_open;
+    bool  bc_closed;           // true = closed mixing box, false = open reservoirs
     int   step;
     float nu;                  // kinematic viscosity = (TAU-0.5)/3
 };
