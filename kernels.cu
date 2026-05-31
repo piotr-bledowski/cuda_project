@@ -73,11 +73,13 @@ __global__ void k_collision(const float* __restrict__ f_in,
 // Replaces the separate k_macroscopic + k_collision pair for the inner loop.
 // ρ and u are computed entirely in registers — no global write of scalar fields.
 __global__ void k_collide(const float* __restrict__ f_in,
-                           float* __restrict__ f_out)
+                           float* __restrict__ f_out,
+                           const bool* __restrict__ wall)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= WIDTH || y >= HEIGHT) return;
+    if (wall[S_IDX(y, x)]) return;
 
     float fi[Q];
     float r = 0.f, vx = 0.f, vy = 0.f;
@@ -115,7 +117,8 @@ __global__ void k_collide(const float* __restrict__ f_in,
 // Bank access: stride between consecutive threads = Q = 9, which is coprime
 // with 32 → no bank conflicts in either half-warp.
 __global__ void k_streaming_shmem(float* __restrict__ f_in,
-                                   const float* __restrict__ f_out)
+                                   const float* __restrict__ f_out,
+                                   const bool* __restrict__ wall)
 {
     const int tx = threadIdx.x;   // 0 .. BLOCK_DIM-1
     const int ty = threadIdx.y;
@@ -158,13 +161,16 @@ __global__ void k_streaming_shmem(float* __restrict__ f_in,
         int gsy = y - d_cy[i];
         if (gsx < 0 || gsx >= WIDTH || gsy < 0 || gsy >= HEIGHT)
             continue;   // out-of-domain: k_outer_boundary handles this direction
+        if (wall[S_IDX(gsy, gsx)])
+            continue;   // wall source: k_wall_link_bounce_back handles this direction
         // Source local coords in the tile (always 0..TILE_DIM-1 for BLOCK_DIM=16)
         f_in[F_IDX(y, x, i)] = s[ty + 1 - d_cy[i]][tx + 1 - d_cx[i]][i];
     }
 }
 
 __global__ void k_streaming(float* __restrict__ f_in,
-                             const float* __restrict__ f_out)
+                             const float* __restrict__ f_out,
+                             const bool* __restrict__ wall)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -176,8 +182,29 @@ __global__ void k_streaming(float* __restrict__ f_in,
         int sy = y - d_cy[i];
         // Non-periodic: only pull from interior neighbors; boundary
         // directions are filled by k_outer_boundary (prevents left↔right leak).
-        if (sx >= 0 && sx < WIDTH && sy >= 0 && sy < HEIGHT)
+        if (sx >= 0 && sx < WIDTH && sy >= 0 && sy < HEIGHT
+            && !wall[S_IDX(sy, sx)])
             f_in[F_IDX(y, x, i)] = f_out[F_IDX(sy, sx, i)];
+    }
+}
+
+// Reflect links on fluid nodes that point into a wall (fixes internal barrier leak).
+__global__ void k_wall_link_bounce_back(float* __restrict__ f_in,
+                                         const float* __restrict__ f_out,
+                                         const bool* __restrict__ wall)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= WIDTH || y >= HEIGHT) return;
+    if (wall[S_IDX(y, x)]) return;
+
+    #pragma unroll
+    for (int i = 1; i < Q; ++i) {
+        int sx = x - d_cx[i];
+        int sy = y - d_cy[i];
+        if (sx >= 0 && sx < WIDTH && sy >= 0 && sy < HEIGHT
+            && wall[S_IDX(sy, sx)])
+            f_in[F_IDX(y, x, i)] = f_out[F_IDX(y, x, d_opp[i])];
     }
 }
 

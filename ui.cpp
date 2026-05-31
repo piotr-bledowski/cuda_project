@@ -11,8 +11,6 @@ static constexpr int PANEL_X[3] = {
     0,
     PANEL_W + DIVIDER_W,
     2 * PANEL_W + 2 * DIVIDER_W };
-// x-coordinate where the vertical divider inside the stats bar sits
-static constexpr int VSTATS_X = 458;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 static Uint32 pack_argb(Uint8 r, Uint8 g, Uint8 b)
@@ -92,7 +90,7 @@ static void fill_sim_texture(SDL_Texture* tex,
 SDL_Window* ui_create_window()
 {
     return SDL_CreateWindow(
-        "LBM CUDA  |  [Q/W/E] modes  [C] clear  [R] reset  [SPACE] hole  [B] BC",
+        "LBM CUDA  |  [Q/W/E] modes  [P] pause  [C] clear  [R] reset  [SPACE] hole  [B] BC",
         WIN_W, WIN_H, 0);
 }
 
@@ -128,9 +126,9 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
         SDL_RenderTexture(ren, tex, &src, &dst);
     }
 
-    // ── Panel dividers ────────────────────────────────────────────────────────
-    fill_rect(ren, PANEL_W, 0, DIVIDER_W, PANEL_H, 55, 55, 60);
-    fill_rect(ren, 2 * PANEL_W + DIVIDER_W, 0, DIVIDER_W, PANEL_H, 55, 55, 60);
+    // ── Panel dividers (extend through stats bar) ─────────────────────────────
+    fill_rect(ren, PANEL_W, 0, DIVIDER_W, WIN_H, 55, 55, 60);
+    fill_rect(ren, 2 * PANEL_W + DIVIDER_W, 0, DIVIDER_W, WIN_H, 55, 55, 60);
 
     // ── Panel header bars (semi-transparent overlay at top of each panel) ─────
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -146,9 +144,6 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
     fill_rect(ren, 0, PANEL_H, WIN_W, 2, 60, 60, 65);               // separator line
     fill_rect(ren, 0, PANEL_H + 2, WIN_W, STATS_H - 2, 15, 15, 20); // background
 
-    // Vertical divider between general and per-panel info
-    fill_rect(ren, VSTATS_X, PANEL_H + 2, 2, STATS_H - 2, 48, 48, 55);
-
     // ── All text rendered at TEXT_SCALE ───────────────────────────────────────
     SDL_SetRenderScale(ren, TEXT_SCALE, TEXT_SCALE);
 
@@ -157,79 +152,91 @@ void ui_draw_frame(SDL_Renderer* ren, SDL_Texture* tex,
     for (int p = 0; p < 3; ++p)
         txt(ren, (float)(PANEL_X[p] + 8), 8.f, hlabels[p], 170, 170, 255);
 
-    // ── General stats (left of stats bar) ────────────────────────────────────
     char buf[256];
-    float sy = (float)(PANEL_H + 10);
+    const float stats_y0 = (float)(PANEL_H + 10);
 
-    snprintf(buf, sizeof(buf), "FPS: %.1f   SPS: %.0f   Step: %d   (%d st/fr)",
-        (double)stats.fps, (double)stats.sps, stats.step, stats.steps_per_frame);
-    txt(ren, 8.f, sy, buf, 230, 230, 230);
+    // ── Column 0 — general + density stats (under density panel) ─────────────
+    float sy = stats_y0;
+    const float col0 = (float)(PANEL_X[0] + 8);
+
+    snprintf(buf, sizeof(buf), "FPS: %.1f   SPS: %.0f   Step: %d   (%d st/fr)%s",
+        (double)stats.fps, (double)stats.sps, stats.step, stats.steps_per_frame,
+        stats.sim_paused ? "  [PAUSED]" : "");
+    txt(ren, col0, sy, buf, stats.sim_paused ? 255 : 230, stats.sim_paused ? 120 : 230, stats.sim_paused ? 120 : 230);
     sy += LINE_H;
 
     snprintf(buf, sizeof(buf), "Grid: %dx%d   TAU: %.2f   nu: %.4f",
         WIDTH, HEIGHT, (double)TAU, (double)stats.nu);
-    txt(ren, 8.f, sy, buf);
+    txt(ren, col0, sy, buf);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f     Hole: %s     BC: %s",
+    snprintf(buf, sizeof(buf), "rho_L: %.3f   rho_R: %.3f   Hole: %s   BC: %s",
         (double)RHO_LEFT, (double)RHO_RIGHT,
-        stats.hole_open ? "OPEN  " : "CLOSED",
-        stats.bc_closed ? "CLOSED" : "OPEN  ");
+        stats.hole_open ? "OPEN" : "CLOSED",
+        stats.bc_closed ? "CLOSED" : "OPEN");
     if (stats.hole_open)
-        txt(ren, 8.f, sy, buf, 255, 205, 80);
+        txt(ren, col0, sy, buf, 255, 205, 80);
     else
-        txt(ren, 8.f, sy, buf, 160, 160, 160);
+        txt(ren, col0, sy, buf, 160, 160, 160);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "GPU: %s   SMs: %d", stats.gpu_name, stats.sm_count);
-    txt(ren, 8.f, sy, buf, 140, 220, 140);
+    snprintf(buf, sizeof(buf), "GPU: %s", stats.gpu_name);
+    txt(ren, col0, sy, buf, 140, 220, 140);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "Kernels: %dx%d blk x %dx%d thr  =  %d threads",
-        stats.grid_x, stats.grid_y, stats.block_x, stats.block_y,
-        stats.grid_x * stats.grid_y * stats.block_x * stats.block_y);
-    txt(ren, 8.f, sy, buf);
+    snprintf(buf, sizeof(buf), "SMs: %d   Occ: %.1f%%   Blk: %dx%d x %dx%d",
+        stats.sm_count, (double)stats.occupancy_pct,
+        stats.grid_x, stats.grid_y, stats.block_x, stats.block_y);
+    txt(ren, col0, sy, buf);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "Theoretical occupancy: %.1f%%", (double)stats.occupancy_pct);
-    txt(ren, 8.f, sy, buf);
-
-    // ── Per-panel stats (right of stats bar) ─────────────────────────────────
-    const int RX = VSTATS_X + 10;
-    const int COL_W = (WIN_W - RX) / 3;
-
-    const char* pnames[3] = { "DENSITY (LBM)", "VEL X (lu/ts)", "VEL Y (lu/ts)" };
-    float mins[3] = { stats.rho_min, stats.ux_min, stats.uy_min };
-    float maxs[3] = { stats.rho_max, stats.ux_max, stats.uy_max };
-
-    // Vertical alignment guides in stats area (subtle, aligned with panel centres)
-    // (drawn after texture, before text — kept as text overlay for simplicity)
-
-    sy = (float)(PANEL_H + 10);
-
-    for (int p = 0; p < 3; ++p)
-        txt(ren, (float)(RX + p * COL_W), sy, pnames[p], 175, 175, 255);
+    txt(ren, col0, sy, "DENSITY (LBM)", 175, 175, 255);
     sy += LINE_H;
 
-    for (int p = 0; p < 3; ++p)
-    {
-        snprintf(buf, sizeof(buf), "min: %+.4f", (double)mins[p]);
-        txt(ren, (float)(RX + p * COL_W), sy, buf, 110, 190, 255);
-    }
+    snprintf(buf, sizeof(buf), "min: %+.4f   max: %+.4f",
+        (double)stats.rho_min, (double)stats.rho_max);
+    txt(ren, col0, sy, buf, 210, 175, 210);
     sy += LINE_H;
 
-    for (int p = 0; p < 3; ++p)
-    {
-        snprintf(buf, sizeof(buf), "max: %+.4f", (double)maxs[p]);
-        txt(ren, (float)(RX + p * COL_W), sy, buf, 255, 140, 110);
-    }
+    snprintf(buf, sizeof(buf), "map: %.3f..%.3f",
+        (double)stats.viz_rho_min, (double)stats.viz_rho_max);
+    txt(ren, col0, sy, buf, 140, 140, 160);
+
+    // ── Column 1 — vel X stats (under vel X panel) ───────────────────────────
+    sy = stats_y0;
+    const float col1 = (float)(PANEL_X[1] + 8);
+
+    txt(ren, col1, sy, "VEL X (lu/ts)", 175, 175, 255);
     sy += LINE_H;
 
-    snprintf(buf, sizeof(buf), "map: %.3f..%.3f", (double)stats.viz_rho_min, (double)stats.viz_rho_max);
-    txt(ren, (float)RX, sy, buf, 140, 140, 160);
+    snprintf(buf, sizeof(buf), "min: %+.4f", (double)stats.ux_min);
+    txt(ren, col1, sy, buf, 110, 190, 255);
+    sy += LINE_H;
+
+    snprintf(buf, sizeof(buf), "max: %+.4f", (double)stats.ux_max);
+    txt(ren, col1, sy, buf, 255, 140, 110);
+    sy += LINE_H;
+
     snprintf(buf, sizeof(buf), "scale: +/-%.4f", (double)stats.viz_vel_scale);
-    txt(ren, (float)(RX + COL_W), sy, buf, 140, 140, 160);
-    txt(ren, (float)(RX + 2 * COL_W), sy, buf, 140, 140, 160);
+    txt(ren, col1, sy, buf, 140, 140, 160);
+
+    // ── Column 2 — vel Y stats (under vel Y panel) ───────────────────────────
+    sy = stats_y0;
+    const float col2 = (float)(PANEL_X[2] + 8);
+
+    txt(ren, col2, sy, "VEL Y (lu/ts)", 175, 175, 255);
+    sy += LINE_H;
+
+    snprintf(buf, sizeof(buf), "min: %+.4f", (double)stats.uy_min);
+    txt(ren, col2, sy, buf, 110, 190, 255);
+    sy += LINE_H;
+
+    snprintf(buf, sizeof(buf), "max: %+.4f", (double)stats.uy_max);
+    txt(ren, col2, sy, buf, 255, 140, 110);
+    sy += LINE_H;
+
+    snprintf(buf, sizeof(buf), "scale: +/-%.4f", (double)stats.viz_vel_scale);
+    txt(ren, col2, sy, buf, 140, 140, 160);
 
     SDL_SetRenderScale(ren, 1.0f, 1.0f);
 

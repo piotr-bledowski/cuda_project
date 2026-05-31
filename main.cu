@@ -283,6 +283,7 @@ int main(int argc, char* argv[])
 
     bool is_drawing = false;
     bool is_erasing = false;
+    bool sim_paused = false;
 
     while (running)
     {
@@ -334,6 +335,10 @@ int main(int argc, char* argv[])
                     cudaMemcpy(d_wall, h_wall, (size_t)HEIGHT * WIDTH * sizeof(bool), cudaMemcpyHostToDevice);
                 }
             }
+
+            // P - pause / resume simulation
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_P)
+                sim_paused = !sim_paused;
 
             // B - toggle closed/open boundary mode
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_B)
@@ -406,11 +411,12 @@ int main(int argc, char* argv[])
         // ── Simulation: steps_per_frame substeps before each render ──────────
         // k_collide (fused macro+collision) + k_streaming_shmem (tiled pull)
         // run back-to-back with no device sync between steps.
-        // Wall bounce-back and outer BC follow each streaming step.
-        if (SDL_GetTicks() >= resume_time) {
+        // Wall link bounce-back, wall bounce-back, and outer BC follow streaming.
+        if (!sim_paused && SDL_GetTicks() >= resume_time) {
             for (int sub = 0; sub < steps_per_frame; ++sub) {
-                k_collide << <grid2d, block2d >> > (d_f_in, d_f_out);
-                k_streaming_shmem << <grid2d, block2d >> > (d_f_in, d_f_out);
+                k_collide << <grid2d, block2d >> > (d_f_in, d_f_out, d_wall);
+                k_streaming_shmem << <grid2d, block2d >> > (d_f_in, d_f_out, d_wall);
+                k_wall_link_bounce_back << <grid2d, block2d >> > (d_f_in, d_f_out, d_wall);
                 k_wall_bounce_back << <grid2d, block2d >> > (d_f_in, d_f_out, d_wall);
                 k_outer_boundary << <grid2d, block2d >> > (d_f_in, d_f_out, d_wall, bc_mode);
             }
@@ -447,7 +453,9 @@ int main(int argc, char* argv[])
         stats.uy_max = uy_max;
         stats.hole_open = hole_open;
         stats.bc_closed = (bc_mode == BC_CLOSED);
-        stats.step += steps_per_frame;
+        stats.sim_paused = sim_paused;
+        if (!sim_paused)
+            stats.step += steps_per_frame;
 
         // FPS and SPS — exponential moving average over frames
         Uint64 now = SDL_GetTicks();
@@ -455,7 +463,10 @@ int main(int argc, char* argv[])
         if (elapsed > 0) {
             float measured_fps = 1000.f / (float)elapsed;
             stats.fps = stats.fps * 0.9f + 0.1f * measured_fps;
-            stats.sps = stats.sps * 0.9f + 0.1f * (steps_per_frame * measured_fps);
+            if (sim_paused)
+                stats.sps = stats.sps * 0.9f;
+            else
+                stats.sps = stats.sps * 0.9f + 0.1f * (steps_per_frame * measured_fps);
         }
         prev_ticks = now;
 
