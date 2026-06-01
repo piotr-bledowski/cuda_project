@@ -104,7 +104,7 @@ static void capture_viz_bounds(const float* h_rho,
     }
 
     if (rho_max - rho_min < 0.01f) {
-        rho_min = RHO_RIGHT; 
+        rho_min = RHO_RIGHT;
         rho_max = RHO_LEFT;
     }
 
@@ -124,7 +124,6 @@ void update_central_wall(bool* h_wall, bool* d_wall, int num_holes, bool is_open
     }
 
     if (is_open) {
-        // Scale: 1 = 30px, 2 = 15px, 3 = 10px, 4 = 7px
         int hole_size = 30 / num_holes;
         int total_hole_space = num_holes * hole_size;
         int remaining_wall = HEIGHT - total_hole_space;
@@ -183,10 +182,8 @@ void load_scenario(int scenario, float* h_rho, bool* h_wall, float* d_f_in, floa
                 }
             }
             else if (scenario == 4) {
-
             }
 
-            // Aplikowanie gęstości
             h_rho[S_IDX(y, x)] = r;
             for (int i = 0; i < Q; ++i) {
                 h_f[F_IDX(y, x, i)] = w0[i] * r;
@@ -194,7 +191,6 @@ void load_scenario(int scenario, float* h_rho, bool* h_wall, float* d_f_in, floa
         }
     }
 
-    // Wysyłanie wszystkiego na GPU
     cudaMemcpy(d_f_in, h_f.data(), f_sz, cudaMemcpyHostToDevice);
     cudaMemcpy(d_f_out, h_f.data(), f_sz, cudaMemcpyHostToDevice);
     cudaMemcpy(d_rho, h_rho, sc_sz, cudaMemcpyHostToDevice);
@@ -204,19 +200,18 @@ void load_scenario(int scenario, float* h_rho, bool* h_wall, float* d_f_in, floa
 }
 
 void flood_fill_density(int start_x, int start_y, float target_rho, float* h_rho, bool* h_wall, float* d_f_in, float* d_f_out, float* d_rho) {
-    if (h_wall[S_IDX(start_y, start_x)]) return; // Nie wylewamy wody wewnątrz betonu!
+    if (h_wall[S_IDX(start_y, start_x)]) return;
 
     float original_rho = h_rho[S_IDX(start_y, start_x)];
-    // Zabezpieczenie, by nie wlewać tego samego do tego samego (uniknięcie pętli)
     if (std::abs(original_rho - target_rho) < 0.01f) return;
 
     std::queue<std::pair<int, int>> q;
     q.push({ start_x, start_y });
 
+    // The liquid is spread only in 4 directions so that it does not leak diagonally through thin walls
     int dx[] = { 0, 0, -1, 1 };
     int dy[] = { -1, 1, 0, 0 };
 
-    // Pobieramy cały obecny płyn z GPU do RAMu, żeby nie skasować fal na zewnątrz naszego naczynia
     const size_t f_sz = (size_t)HEIGHT * WIDTH * Q * sizeof(float);
     std::vector<float> h_f(HEIGHT * WIDTH * Q);
     cudaMemcpy(h_f.data(), d_f_in, f_sz, cudaMemcpyDeviceToHost);
@@ -226,28 +221,58 @@ void flood_fill_density(int start_x, int start_y, float target_rho, float* h_rho
     std::vector<bool> visited(HEIGHT * WIDTH, false);
     visited[S_IDX(start_y, start_x)] = true;
 
-    // Klasyczne rozlewanie (BFS)
+    std::vector<int> walls_to_remove;
+    std::vector<bool> visited_walls(HEIGHT * WIDTH, false);
+
+    int wdx[] = { -1, 0, 1, -1, 1, -1,  0,  1 };
+    int wdy[] = { -1, -1, -1,  0,  0,  1,  1,  1 };
+
+    // Classic Liquid Spilling
     while (!q.empty()) {
         auto [cx, cy] = q.front();
         q.pop();
 
         int idx = S_IDX(cy, cx);
-        h_rho[idx] = target_rho; // Zmieniamy gęstość na nową
+        h_rho[idx] = target_rho;
 
-        // Restartujemy fizykę cząsteczek TYLKO w tym jednym zamalowanym pikselu (prędkość = 0)
         for (int i = 0; i < Q; ++i) {
             h_f[F_IDX(cy, cx, i)] = w0[i] * target_rho;
         }
 
-        // Sprawdzamy 4 sąsiadów
         for (int dir = 0; dir < 4; ++dir) {
             int nx = cx + dx[dir];
             int ny = cy + dy[dir];
 
             if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT) {
                 int n_idx = S_IDX(ny, nx);
-                // Jeśli to nie mur, nie byliśmy tu i ma starą gęstość - lejemy dalej!
-                if (!h_wall[n_idx] && !visited[n_idx] && std::abs(h_rho[n_idx] - original_rho) < 0.01f) {
+
+                if (h_wall[n_idx]) {
+                    if (!visited_walls[n_idx]) {
+                        std::queue<std::pair<int, int>> wq;
+                        wq.push({ nx, ny });
+                        visited_walls[n_idx] = true;
+
+                        while (!wq.empty()) {
+                            auto [wx, wy] = wq.front();
+                            wq.pop();
+                            walls_to_remove.push_back(S_IDX(wy, wx));
+
+                            for (int wdir = 0; wdir < 8; ++wdir) {
+                                int nwx = wx + wdx[wdir];
+                                int nwy = wy + wdy[wdir];
+
+                                if (nwx >= 0 && nwx < WIDTH && nwy >= 0 && nwy < HEIGHT) {
+                                    int nw_idx = S_IDX(nwy, nwx);
+                                    if (h_wall[nw_idx] && !visited_walls[nw_idx]) {
+                                        visited_walls[nw_idx] = true;
+                                        wq.push({ nwx, nwy });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (!visited[n_idx] && std::abs(h_rho[n_idx] - original_rho) < 0.01f) {
                     visited[n_idx] = true;
                     q.push({ nx, ny });
                 }
@@ -255,7 +280,10 @@ void flood_fill_density(int start_x, int start_y, float target_rho, float* h_rho
         }
     }
 
-    // Odsyłamy zamalowany płyn z powrotem na kartę graficzną
+    for (int w_idx : walls_to_remove) {
+        h_wall[w_idx] = false;
+    }
+
     cudaMemcpy(d_f_in, h_f.data(), f_sz, cudaMemcpyHostToDevice);
     cudaMemcpy(d_f_out, h_f.data(), f_sz, cudaMemcpyHostToDevice);
     cudaMemcpy(d_rho, h_rho, (size_t)HEIGHT * WIDTH * sizeof(float), cudaMemcpyHostToDevice);
@@ -269,7 +297,6 @@ int main(int argc, char* argv[])
     const int steps_per_frame = parse_steps_per_frame(argc, argv);
     fprintf(stderr, "LBM: %d step(s) per frame (use -h for help)\n", steps_per_frame);
 
-    // ── SDL setup ─────────────────────────────────────────────────────────────
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -279,11 +306,9 @@ int main(int argc, char* argv[])
     SDL_Renderer* ren = ui_create_renderer(window);
     SDL_Texture* tex = ui_create_sim_texture(ren);
 
-    // ── GPU info ──────────────────────────────────────────────────────────────
     cudaDeviceProp devProp;
     cudaGetDeviceProperties(&devProp, 0);
 
-    // ── Device allocations ────────────────────────────────────────────────────
     const size_t f_sz = (size_t)HEIGHT * WIDTH * Q * sizeof(float);
     const size_t sc_sz = (size_t)HEIGHT * WIDTH * sizeof(float);
     const size_t msk_sz = (size_t)HEIGHT * WIDTH * sizeof(bool);
@@ -297,33 +322,32 @@ int main(int argc, char* argv[])
     cudaMalloc(&d_uy, sc_sz);
     cudaMalloc(&d_wall, msk_sz);
 
-    // ── Host allocations ──────────────────────────────────────────────────────
     std::vector<float> h_rho(HEIGHT * WIDTH, 0.f);
     std::vector<float> h_ux(HEIGHT * WIDTH, 0.f);
     std::vector<float> h_uy(HEIGHT * WIDTH, 0.f);
     bool* h_wall = new bool[HEIGHT * WIDTH]();
 
-    // ── Initial conditions ────────────────────────────────────────────────────
+    std::vector<float> snap_rho(HEIGHT * WIDTH, RHO_RIGHT);
+    bool* snap_wall = new bool[HEIGHT * WIDTH]();
+    bool has_snapshot = false;
+
     bool hole_open = true;
     int  bc_mode = BC_CLOSED;
     int current_holes = 1;
-    int current_scenario = 1; // 1=Komory, 2=Kropla, 3=Szachownica, 4=Sandbox
+    int current_scenario = 1;
 
     load_scenario(current_scenario, h_rho.data(), h_wall, d_f_in, d_f_out, d_rho, d_ux, d_uy, d_wall, true);
     if (current_scenario == 1) {
         update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
     }
 
-    // ── Kernel launch config ──────────────────────────────────────────────────
     const dim3 block2d(16, 16);
     const dim3 grid2d((WIDTH + 15) / 16, (HEIGHT + 15) / 16);
 
-    // Theoretical occupancy — query k_streaming_shmem as it uses the most shmem
     int maxActiveBlocks = 1;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, k_streaming_shmem, block2d.x * block2d.y, 0);
     float occupancy = 100.f * (maxActiveBlocks * block2d.x * block2d.y) / (float)devProp.maxThreadsPerMultiProcessor;
 
-    // ── Stats struct ──────────────────────────────────────────────────────────
     FrameStats stats = {};
     stats.fps = (float)TARGET_FPS;
     stats.sps = (float)(TARGET_FPS * steps_per_frame);
@@ -338,7 +362,6 @@ int main(int argc, char* argv[])
     snprintf(stats.gpu_name, sizeof(stats.gpu_name), "%s", devProp.name);
     capture_viz_bounds(h_rho.data(), h_ux.data(), h_uy.data(), h_wall, stats);
 
-    // ── Main loop ─────────────────────────────────────────────────────────────
     const Uint64 ms_per_frame = 1000u / TARGET_FPS;
     Uint64 prev_ticks = SDL_GetTicks();
     bool running = true;
@@ -352,7 +375,6 @@ int main(int argc, char* argv[])
     {
         bool wall_updated = false;
 
-        // Events
         SDL_Event ev;
         while (SDL_PollEvent(&ev))
         {
@@ -365,12 +387,12 @@ int main(int argc, char* argv[])
                 if (ev.key.key == SDLK_Q) new_scenario = 1;
                 if (ev.key.key == SDLK_W) new_scenario = 2;
                 if (ev.key.key == SDLK_E) new_scenario = 3;
-                if (ev.key.key == SDLK_D) new_scenario = 4; // NOWY TRYB: D = Draw / Sandbox
+                if (ev.key.key == SDLK_D) new_scenario = 4;
 
                 if (new_scenario != -1 && new_scenario != current_scenario) {
                     current_scenario = new_scenario;
+                    has_snapshot = false;
 
-                    // TRUE: Zmieniamy tryb, więc usuwamy wszelkie bazgroły myszką
                     load_scenario(current_scenario, h_rho.data(), h_wall, d_f_in, d_f_out, d_rho, d_ux, d_uy, d_wall, true);
                     if (current_scenario == 1) {
                         update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
@@ -382,16 +404,42 @@ int main(int argc, char* argv[])
 
             // R - Reset
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_R) {
-                load_scenario(current_scenario, h_rho.data(), h_wall, d_f_in, d_f_out, d_rho, d_ux, d_uy, d_wall, false);
-                if (current_scenario == 1) {
-                    update_central_wall(h_wall, d_wall, current_holes, hole_open, false);
+                if (current_scenario == 4 && has_snapshot) {
+                    std::copy(snap_rho.begin(), snap_rho.end(), h_rho.begin());
+                    std::copy(snap_wall, snap_wall + (HEIGHT * WIDTH), h_wall);
+
+                    std::vector<float> h_f(HEIGHT * WIDTH * Q);
+                    const float w0[Q] = { 4.f / 9.f, 1.f / 9.f, 1.f / 9.f, 1.f / 9.f, 1.f / 9.f, 1.f / 36.f, 1.f / 36.f, 1.f / 36.f, 1.f / 36.f };
+                    for (int y = 0; y < HEIGHT; ++y) {
+                        for (int x = 0; x < WIDTH; ++x) {
+                            float r = h_rho[S_IDX(y, x)];
+                            for (int i = 0; i < Q; ++i) {
+                                h_f[F_IDX(y, x, i)] = w0[i] * r;
+                            }
+                        }
+                    }
+
+                    cudaMemcpy(d_f_in, h_f.data(), f_sz, cudaMemcpyHostToDevice);
+                    cudaMemcpy(d_f_out, h_f.data(), f_sz, cudaMemcpyHostToDevice);
+                    cudaMemcpy(d_rho, h_rho.data(), sc_sz, cudaMemcpyHostToDevice);
+                    cudaMemset(d_ux, 0, sc_sz);
+                    cudaMemset(d_uy, 0, sc_sz);
+                    cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
+                }
+                else {
+                    load_scenario(current_scenario, h_rho.data(), h_wall, d_f_in, d_f_out, d_rho, d_ux, d_uy, d_wall, false);
+                    if (current_scenario == 1) {
+                        update_central_wall(h_wall, d_wall, current_holes, hole_open, false);
+                    }
                 }
                 capture_viz_bounds(h_rho.data(), h_ux.data(), h_uy.data(), h_wall, stats);
                 resume_time = SDL_GetTicks() + 1000;
             }
 
-            // C - Wyczyszczenie ścian
+            // C - Clear walls
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_C) {
+                has_snapshot = false;
+
                 if (current_scenario == 1) {
                     update_central_wall(h_wall, d_wall, current_holes, hole_open, true);
                 }
@@ -401,11 +449,9 @@ int main(int argc, char* argv[])
                 }
             }
 
-            // B - toggle closed/open boundary mode
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_B)
                 bc_mode = (bc_mode == BC_CLOSED) ? BC_OPEN : BC_CLOSED;
 
-            // SPACE - open/close holes
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_SPACE) {
                 if (current_scenario == 1) {
                     hole_open = !hole_open;
@@ -413,7 +459,6 @@ int main(int argc, char* argv[])
                 }
             }
 
-            // 1-4 number of holes
             if (ev.type == SDL_EVENT_KEY_DOWN) {
                 if (current_scenario == 1) {
                     int new_holes = -1;
@@ -444,9 +489,12 @@ int main(int argc, char* argv[])
 
                         flood_fill_density(grid_x, grid_y, target_density, h_rho.data(), h_wall, d_f_in, d_f_out, d_rho);
 
-                        std::fill(h_wall, h_wall + (HEIGHT * WIDTH), false);
-                        cudaMemcpy(d_wall, h_wall, (size_t)HEIGHT * WIDTH * sizeof(bool), cudaMemcpyHostToDevice);
+                        cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
                         wall_updated = true;
+
+                        std::copy(h_rho.begin(), h_rho.end(), snap_rho.begin());
+                        std::copy(h_wall, h_wall + (HEIGHT * WIDTH), snap_wall);
+                        has_snapshot = true;
 
                         resume_time = SDL_GetTicks() + 500;
                     }
@@ -462,20 +510,16 @@ int main(int argc, char* argv[])
             float mouse_x, mouse_y;
             SDL_GetMouseState(&mouse_x, &mouse_y);
 
-            // Przeliczenie pikseli na indeks siatki LBM
             int grid_x = (int)mouse_x / CELL_SIZE;
             int grid_y = (int)mouse_y / CELL_SIZE;
 
-            // Zabezpieczenie przed wyjściem myszką poza ekran
             if (grid_x >= 0 && grid_x < WIDTH && grid_y >= 0 && grid_y < HEIGHT) {
                 int idx = S_IDX(grid_y, grid_x);
 
-                // Rysujemy
                 if (is_drawing && !h_wall[idx]) {
                     h_wall[idx] = true;
                     wall_updated = true;
                 }
-                // Ścieramy
                 else if (is_erasing && h_wall[idx]) {
                     h_wall[idx] = false;
                     wall_updated = true;
@@ -487,10 +531,6 @@ int main(int argc, char* argv[])
             cudaMemcpy(d_wall, h_wall, msk_sz, cudaMemcpyHostToDevice);
         }
 
-        // ── Simulation: steps_per_frame substeps before each render ──────────
-        // k_collide (fused macro+collision) + k_streaming_shmem (tiled pull)
-        // run back-to-back with no device sync between steps.
-        // Wall bounce-back and outer BC follow each streaming step.
         if (SDL_GetTicks() >= resume_time) {
             for (int sub = 0; sub < steps_per_frame; ++sub) {
                 k_collide << <grid2d, block2d >> > (d_f_in, d_f_out);
@@ -499,16 +539,14 @@ int main(int argc, char* argv[])
                 k_outer_boundary << <grid2d, block2d >> > (d_f_in, d_f_out, d_wall, bc_mode);
             }
         }
-        // Extract macroscopic fields once per frame for visualisation
+
         k_macroscopic << <grid2d, block2d >> > (d_f_in, d_rho, d_ux, d_uy);
         cudaDeviceSynchronize();
 
-        // Copy scalars to host (single D2H per frame)
         cudaMemcpy(h_rho.data(), d_rho, sc_sz, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_ux.data(), d_ux, sc_sz, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_uy.data(), d_uy, sc_sz, cudaMemcpyDeviceToHost);
 
-        // Per-field min/max (skip wall cells)
         float rho_min = FLT_MAX, rho_max = -FLT_MAX;
         float ux_min = FLT_MAX, ux_max = -FLT_MAX;
         float uy_min = FLT_MAX, uy_max = -FLT_MAX;
@@ -533,7 +571,6 @@ int main(int argc, char* argv[])
         stats.bc_closed = (bc_mode == BC_CLOSED);
         stats.step += steps_per_frame;
 
-        // FPS and SPS — exponential moving average over frames
         Uint64 now = SDL_GetTicks();
         Uint64 elapsed = now - prev_ticks;
         if (elapsed > 0) {
@@ -551,7 +588,6 @@ int main(int argc, char* argv[])
             SDL_Delay((Uint32)(ms_per_frame - frame_ms));
     }
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
     cudaFree(d_f_in);
     cudaFree(d_f_out);
     cudaFree(d_rho);
@@ -559,6 +595,7 @@ int main(int argc, char* argv[])
     cudaFree(d_uy);
     cudaFree(d_wall);
     delete[] h_wall;
+    delete[] snap_wall;
     SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(window);
